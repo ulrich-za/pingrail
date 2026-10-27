@@ -1,0 +1,33 @@
+[Unit]
+Description=pingrail latency and route monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pingrail
+Group=pingrail
+ExecStart=/usr/bin/pingrail service run
+Restart=on-failure
+RestartSec=5
+
+# Raw ICMP sockets need CAP_NET_RAW; nothing else is granted.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+NoNewPrivileges=true
+
+StateDirectory=pingrail
+StateDirectoryMode=0750
+ConfigurationDirectory=pingrail
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

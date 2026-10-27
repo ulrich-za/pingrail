@@ -1,0 +1,49 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # System account the service runs as.
+        if ! getent passwd pingrail >/dev/null; then
+            adduser --system --group --home /var/lib/pingrail --no-create-home --quiet pingrail
+        fi
+        mkdir -p /etc/pingrail /var/lib/pingrail
+
+        # Let local (non-service) TUI sessions open raw ICMP sockets.
+        if command -v setcap >/dev/null 2>&1; then
+            setcap cap_net_raw+ep /usr/bin/pingrail || echo "pingrail: could not set CAP_NET_RAW on /usr/bin/pingrail" >&2
+        fi
+
+        # Data directory, API token, token access for the installing user, and
+        # on first install the one-time import from hopwatch (pingrail's
+        # earlier name): history, web password, share links and settings.
+        /usr/bin/pingrail service init 2>/dev/null | grep -iE "imported|certificate" || true
+        if [ ! -f /etc/pingrail/pingrail.toml ]; then
+            cp /usr/share/pingrail/pingrail.toml.example /etc/pingrail/pingrail.toml
+        fi
+        chown -R pingrail:pingrail /var/lib/pingrail
+        chmod 0750 /var/lib/pingrail
+
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            systemctl enable pingrail.service >/dev/null 2>&1 || true
+            systemctl restart pingrail.service >/dev/null 2>&1 || true
+        fi
+
+        ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        echo ""
+        if [ -d /run/systemd/system ]; then
+            echo "pingrail is installed and its background service is running."
+        else
+            echo "pingrail is installed. systemd isn't running here, so start the service yourself:"
+            echo "  sudo -u pingrail /usr/bin/pingrail service run"
+        fi
+        echo "  Terminal UI:  pingrail"
+        echo "  Web UI:       https://${ip:-localhost}:8040/  (self-signed certificate: check the fingerprint above)"
+        echo "  Share links:  https on port 8041 (point a Cloudflare Tunnel at https://localhost:8041; see /usr/share/doc/pingrail/README.md)"
+        echo "  Set the web password from the TUI (press P) or with: sudo pingrail passwd"
+        echo ""
+        ;;
+esac
+
+exit 0

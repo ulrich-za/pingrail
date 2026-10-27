@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  pingrail Windows installer (WiX 3 syntax; built with msitools' wixl on
+  Windows or Linux by packaging/build-msi.sh).
+
+  Installs pingrail.exe to Program Files, adds its folder to PATH, creates a
+  Start menu shortcut for the terminal UI, registers and starts the "pingrail"
+  Windows service (as the low-privilege LocalService account, automatic
+  start), and opens the web UI and share-link ports in Windows Firewall for
+  private and domain networks.
+
+  Replaces hopwatch (pingrail's earlier name): any installed hopwatch is
+  removed first, and on first start pingrail imports its history, password,
+  share links and settings from C:\ProgramData\hopwatch (left in place).
+
+  Build:  wixl -a x64 -D Version=0.3.1 -D SourceDir=<staging dir> -o pingrail.msi pingrail.wxs
+  The staging dir holds pingrail.exe, pingrail.ico, README.md, LICENSE,
+  THIRD-PARTY-NOTICES.txt, pingrail.toml.example and fonts/.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="pingrail"
+           Language="1033"
+           Version="$(var.Version)"
+           Manufacturer="Ulrich Holtzhausen"
+           UpgradeCode="5F42E946-5089-4FB1-BD5F-8B5BD613FEE9">
+
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Manufacturer="Ulrich Holtzhausen"
+             Description="pingrail latency and route monitor"
+             Comments="Copyright (C) 2026 Ulrich Holtzhausen. Licensed under the Apache License 2.0." />
+
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of pingrail is already installed." />
+
+    <!-- Windows Installer decides which files to copy before it removes the
+         old version. "e": a file of the same version counts as replaceable,
+         so rebuilding and reinstalling the same version works too. -->
+    <Property Id="REINSTALLMODE" Value="emus" />
+
+    <!-- hopwatch, any version: removed by RemoveExistingProducts below. -->
+    <Upgrade Id="B2DA16CF-0697-4186-8E79-6820ADF0EFE3">
+      <UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes" OnlyDetect="no" Property="HOPWATCHFOUND" />
+    </Upgrade>
+
+    <Media Id="1" Cabinet="pingrail.cab" EmbedCab="yes" />
+
+    <Icon Id="pingrail.ico" SourceFile="$(var.SourceDir)/pingrail.ico" />
+    <Property Id="ARPPRODUCTICON" Value="pingrail.ico" />
+    <Property Id="ARPCONTACT" Value="https://github.com/ulrich-za/pingrail/issues" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/ulrich-za/pingrail" />
+    <Property Id="ARPHELPLINK" Value="https://localhost:8040/" />
+    <Property Id="ARPCOMMENTS" Value="Web UI: https://localhost:8040/ (set its password from the terminal UI by pressing P)" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLDIR" Name="pingrail">
+
+          <Component Id="MainExecutable" Guid="05E0E790-2427-4BF0-B555-1A883C0CBD98" Win64="yes">
+            <!-- wixl doesn't read versions from executables. Without one in the
+                 File table, an installed (versioned) pingrail.exe is never
+                 replaced and the custom actions below fail with error 2753.
+                 pingrail.rc's FILEVERSION is the same number (a test checks). -->
+            <File Id="pingrailExe" Name="pingrail.exe" Source="$(var.SourceDir)/pingrail.exe" KeyPath="yes"
+                  DefaultVersion="$(var.Version).0" />
+
+            <ServiceInstall Id="pingrailService"
+                            Name="pingrail"
+                            DisplayName="pingrail latency monitor"
+                            Description="Pings and traces routes to monitored hosts and serves the pingrail web UI."
+                            Type="ownProcess"
+                            Start="auto"
+                            ErrorControl="normal"
+                            Account="NT AUTHORITY\LocalService"
+                            Arguments="service run" />
+            <ServiceControl Id="pingrailServiceControl"
+                            Name="pingrail"
+                            Start="install"
+                            Stop="both"
+                            Remove="uninstall"
+                            Wait="yes" />
+          </Component>
+
+          <Component Id="Documentation" Guid="16D17126-3AC7-417B-9979-0B12927FB804" Win64="yes">
+            <File Id="readme" Name="README.md" Source="$(var.SourceDir)/README.md" KeyPath="yes" />
+            <File Id="license" Name="LICENSE" Source="$(var.SourceDir)/LICENSE" />
+            <File Id="notice" Name="NOTICE" Source="$(var.SourceDir)/NOTICE" />
+            <File Id="notices" Name="THIRD-PARTY-NOTICES.txt" Source="$(var.SourceDir)/THIRD-PARTY-NOTICES.txt" />
+            <File Id="exampleConfig" Name="pingrail.toml.example" Source="$(var.SourceDir)/pingrail.toml.example" />
+          </Component>
+
+          <!-- Fonts for PDF/PNG reports: separate files under their own licence. -->
+          <Directory Id="FONTSDIR" Name="fonts">
+            <Component Id="ReportFonts" Guid="AA76EB98-7C42-4A20-856B-3D9D8FF9356B" Win64="yes">
+              <File Id="fontRegular" Name="DejaVuSans.ttf" Source="$(var.SourceDir)/fonts/DejaVuSans.ttf" KeyPath="yes" />
+              <File Id="fontBold" Name="DejaVuSans-Bold.ttf" Source="$(var.SourceDir)/fonts/DejaVuSans-Bold.ttf" />
+              <File Id="fontMono" Name="DejaVuSansMono.ttf" Source="$(var.SourceDir)/fonts/DejaVuSansMono.ttf" />
+              <File Id="fontLicense" Name="LICENSE-DejaVu.txt" Source="$(var.SourceDir)/fonts/LICENSE-DejaVu.txt" />
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+
+      <Directory Id="ProgramMenuFolder">
+        <Component Id="StartMenuShortcut" Guid="7C3F1B52-9E4A-4D6B-A1C8-3B2E5F9D0A47" Win64="yes">
+          <Shortcut Id="tuiShortcut"
+                    Name="pingrail"
+                    Description="Open the pingrail terminal UI"
+                    Target="[INSTALLDIR]pingrail.exe"
+                    WorkingDirectory="INSTALLDIR"
+                    Icon="pingrail.ico" />
+          <RegistryValue Root="HKLM" Key="Software\pingrail" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </Directory>
+
+    <Feature Id="Complete" Title="pingrail" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="Documentation" />
+      <ComponentRef Id="ReportFonts" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
+    <!-- Data folder, access for the LocalService account, and the one-time
+         import from hopwatch; runs before the service starts. -->
+    <CustomAction Id="Init" FileKey="pingrailExe" ExeCommand="service init"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- Firewall rule for the web UI port, via pingrail itself (no WiX extensions needed). -->
+    <CustomAction Id="FirewallAdd" FileKey="pingrailExe" ExeCommand="service firewall add"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="FirewallRemove" FileKey="pingrailExe" ExeCommand="service firewall remove"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- pingrail's certificate authority (made by Init) in this PC's trusted
+         roots, so browsers here trust the web UI. It can only vouch for this
+         machine's names and private addresses. -->
+    <CustomAction Id="TrustAdd" FileKey="pingrailExe" ExeCommand="service trust add"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="TrustRemove" FileKey="pingrailExe" ExeCommand="service trust remove"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- pingrail's folder in the system PATH, so "pingrail" works in any terminal. -->
+    <CustomAction Id="PathAdd" FileKey="pingrailExe" ExeCommand="service path add"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="PathRemove" FileKey="pingrailExe" ExeCommand="service path remove"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <InstallExecuteSequence>
+      <!-- Remove an older pingrail, or hopwatch, completely before installing. -->
+      <RemoveExistingProducts Sequence="1410" />
+      <Custom Action="Init" After="InstallFiles">NOT REMOVE</Custom>
+      <Custom Action="FirewallAdd" After="Init">NOT REMOVE</Custom>
+      <Custom Action="PathAdd" After="FirewallAdd">NOT REMOVE</Custom>
+      <Custom Action="TrustAdd" After="PathAdd">NOT REMOVE</Custom>
+      <Custom Action="FirewallRemove" Sequence="3400">REMOVE="ALL"</Custom>
+      <Custom Action="PathRemove" Sequence="3401">REMOVE="ALL"</Custom>
+      <Custom Action="TrustRemove" Sequence="3402">REMOVE="ALL"</Custom>
+    </InstallExecuteSequence>
+  </Product>
+</Wix>

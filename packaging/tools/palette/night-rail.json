@@ -1,0 +1,150 @@
+{
+ "title": "Night Rail: a light page with a navy sidebar in both themes, a cyan average line",
+ "island": true,
+ "hues": {
+  "good": [
+   145,
+   162
+  ],
+  "warn": [
+   72,
+   88
+  ],
+  "crit": [
+   20,
+   34
+  ],
+  "live": [
+   124,
+   138
+  ],
+  "series": [
+   196,
+   222
+  ]
+ },
+ "light": {
+  "surfaces": {
+   "bg": [
+    0.978,
+    0.004,
+    250
+   ],
+   "sidebar": [
+    0.265,
+    0.055,
+    252
+   ],
+   "panel": [
+    0.997,
+    0.002,
+    250
+   ],
+   "hover": [
+    0.93,
+    0.012,
+    250
+   ],
+   "selected": [
+    0.91,
+    0.03,
+    250
+   ],
+   "side_hover": [
+    0.31,
+    0.06,
+    252
+   ],
+   "side_selected": [
+    0.35,
+    0.075,
+    252
+   ]
+  },
+  "L": {
+   "good": [
+    0.5,
+    0.66
+   ],
+   "warn": [
+    0.74,
+    0.86
+   ],
+   "crit": [
+    0.55,
+    0.68
+   ],
+   "live": [
+    0.6,
+    0.76
+   ],
+   "series": [
+    0.42,
+    0.54
+   ]
+  }
+ },
+ "dark": {
+  "surfaces": {
+   "bg": [
+    0.22,
+    0.03,
+    252
+   ],
+   "sidebar": [
+    0.165,
+    0.035,
+    254
+   ],
+   "panel": [
+    0.26,
+    0.035,
+    250
+   ],
+   "hover": [
+    0.3,
+    0.04,
+    250
+   ],
+   "selected": [
+    0.33,
+    0.055,
+    250
+   ],
+   "side_hover": [
+    0.21,
+    0.04,
+    254
+   ],
+   "side_selected": [
+    0.25,
+    0.06,
+    252
+   ]
+  },
+  "ink2_hue": 250,
+  "L": {
+   "good": [
+    0.66,
+    0.84
+   ],
+   "warn": [
+    0.78,
+    0.9
+   ],
+   "crit": [
+    0.62,
+    0.76
+   ],
+   "live": [
+    0.74,
+    0.9
+   ],
+   "series": [
+    0.66,
+    0.84
+   ]
+  }
+ },
+ "file": "packaging/tools/palette/night-rail.json"
+}

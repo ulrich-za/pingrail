@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        rm -rf /var/lib/pingrail /etc/pingrail
+        if getent passwd pingrail >/dev/null; then
+            deluser --quiet --system pingrail >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+exit 0

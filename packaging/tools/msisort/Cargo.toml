@@ -1,0 +1,13 @@
+[package]
+name = "msisort"
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Build tool: put an MSI's table rows in primary-key order (wixl doesn't always), and check it."
+
+[dependencies]
+cfb = "0.15"
+
+# A standalone build tool, not part of pingrail's workspace.
+[workspace]

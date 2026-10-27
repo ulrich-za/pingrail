@@ -1,0 +1,57 @@
+# pingrail configuration
+# Linux: /etc/pingrail/pingrail.toml   Windows: C:\ProgramData\pingrail\pingrail.toml
+# Restart the service after editing (Linux: sudo systemctl restart pingrail,
+# Windows: pingrail service stop, then pingrail service start).
+
+[web]
+# Address the web UI listens on. "0.0.0.0:8040" = reachable from your LAN,
+# "127.0.0.1:8040" = this machine only.
+listen = "0.0.0.0:8040"
+session_hours = 168
+
+[tls]
+# pingrail only speaks HTTPS, on both ports. By default it makes its own
+# certificate authority on first start (ca.pem in its data folder: trust it
+# once on each device, e.g. with the web UI's "Set up a phone") and issues and
+# renews the certificate from it. To use your own certificate instead (e.g.
+# from your CA, Let's Encrypt or a Cloudflare Origin CA), give PEM files:
+cert_file = ""
+key_file = ""
+
+[share]
+# Share links (/s/<code>) get their own port that serves only share pages:
+# no admin UI, no sign-in. To share links on the internet, point a Cloudflare
+# Tunnel (service: https://localhost:8041) or a reverse proxy at this port;
+# see the README for trusting pingrail's certificate from cloudflared.
+# Set listen = "" to turn the separate port off (links then use the web UI port).
+listen = "0.0.0.0:8041"
+# The address people open share links at, e.g. "https://pingrail.example.com".
+# Empty = https://<this machine>:8041, which only works on your network.
+public_url = ""
+# Proxies allowed to tell pingrail a visitor's real address (X-Forwarded-For,
+# CF-Connecting-IP). Add your reverse proxy's IP if it runs on another machine.
+trusted_proxies = ["127.0.0.1", "::1"]
+
+[probe]
+# Defaults for new targets and probes.
+interval_ms = 2500
+timeout_ms = 2000
+packet_size = 56
+max_hops = 30
+hop_stagger_ms = 5
+reverse_dns = true
+
+[storage]
+# Samples older than this are deleted. Each share link can keep the
+# destinations its visitors add for less time (set in the link's settings).
+retention_days = 30
+# Pause destinations added by share-link visitors when free disk space drops
+# below this many MB (your own targets keep running). 0 = never.
+min_free_mb = 1024
+
+[thresholds]
+# Colouring in the TUI, web UI and reports.
+warn_ms = 100.0
+crit_ms = 200.0
+loss_warn_pct = 1.0
+loss_crit_pct = 10.0

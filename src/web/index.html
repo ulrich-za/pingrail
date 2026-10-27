@@ -1,0 +1,566 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex, nofollow">
+<!--@admin-->
+<title>pingrail</title>
+<link rel="preload" href="/fonts/mona-sans.woff2" as="font" type="font/woff2" crossorigin>
+<!--@end-->
+<!--@share-->
+<title>pingrail · shared view</title>
+<!--@end-->
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+<!--@admin-->
+<script src="/app.js" defer></script>
+<!--@end-->
+<!--@share-->
+<script src="/share.js" defer></script>
+<!--@end-->
+</head>
+<body>
+<noscript><p class="noscript">pingrail needs JavaScript to show its graphs.</p></noscript>
+
+<!--@admin-->
+<!-- Sign in. Everything hangs from one rail: a live round trip from this
+     browser to this server. -->
+<div id="login" class="signin" hidden>
+  <a class="skip" href="#password">Skip to sign-in</a>
+  <header class="frame">
+    <p class="frame__host"><svg class="mark" viewBox="18 15 32 45" aria-hidden="true" focusable="false"><path class="mark-rail" d="M22 31V56"/><circle class="mark-ring" cx="34" cy="31" r="12"/><circle class="mark-dot" cx="34" cy="31" r="4.2"/></svg><span class="vh">Server: </span><span data-host>this server</span></p>
+    <button class="trail" type="button" id="login-theme"><span data-theme-label>Dark theme</span></button>
+  </header>
+
+  <main class="login" aria-labelledby="login-title">
+    <p class="word" aria-hidden="true">pingrail</p>
+
+    <section class="probe" aria-labelledby="probe-title">
+      <h2 class="vh" id="probe-title">Round trip to this server</h2>
+      <dl class="readout">
+        <div class="readout__cell"><dt>Round trip</dt><dd><span data-rtt>measuring</span></dd></div>
+        <div class="readout__cell"><dt>Jitter</dt><dd><span data-jitter>&hellip;</span></dd></div>
+        <div class="readout__cell"><dt>Loss</dt><dd><span data-loss>&hellip;</span></dd></div>
+      </dl>
+      <p class="probe__note" data-probe-note>each point = 1&nbsp;s · line = 5&nbsp;s average</p>
+    </section>
+
+    <figure class="trace" aria-labelledby="trace-summary">
+      <svg class="trace__svg" data-trace role="img" aria-labelledby="trace-summary" focusable="false"></svg>
+      <figcaption class="vh" id="trace-summary" data-trace-summary>Measuring the round trip from this browser to this server.</figcaption>
+    </figure>
+
+    <div class="rail" data-rail aria-hidden="true"><span class="rail__node"></span></div>
+
+    <div class="hang">
+      <div class="line" data-stem>
+        <h1 class="lead" id="login-title">Sign in<span class="vh"> to pingrail</span></h1>
+        <p class="intro">See latency, loss and routes from this monitor.</p>
+        <p class="notice" id="login-notice" role="status" hidden></p>
+
+        <form class="form" id="login-form" method="post" novalidate>
+          <div class="field" data-pw>
+            <label class="field__label" for="username">Username</label>
+            <input class="field__input" id="username" name="username" type="text" value="admin"
+                   autocomplete="username webauthn" autocapitalize="none" autocorrect="off" spellcheck="false" required>
+          </div>
+          <div class="field" data-pw>
+            <label class="field__label" for="password">Password</label>
+            <div class="field__row">
+              <input class="field__input" id="password" name="password" type="password"
+                     autocomplete="current-password" enterkeyhint="go" required
+                     aria-describedby="password-msg">
+              <button class="field__toggle trail" type="button" id="reveal" aria-controls="password" aria-pressed="false">Show<span class="vh"> password</span></button>
+            </div>
+            <p class="field__msg" id="password-msg" aria-live="polite"></p>
+          </div>
+          <div class="go">
+            <span class="go__branch" aria-hidden="true"></span>
+            <button class="btn" type="submit" id="login-submit">
+              <span class="btn__label" data-btn-label>Sign in</span>
+              <span class="btn__line" aria-hidden="true"><span class="btn__dot"></span></span>
+              <span class="btn__ring" aria-hidden="true"></span>
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <p class="alt" id="passkey-alt" hidden><button class="trail" type="button" id="passkey-signin">Sign in with a passkey</button></p>
+
+      <details class="forgot" data-pw>
+        <summary class="trail">Forgot the password?</summary>
+        <p>Set a new one on the machine running the service: press <kbd>P</kbd> in pingrail's terminal UI, or run <code>pingrail passwd</code>.</p>
+      </details>
+      <details class="forgot" id="passkey-lost" hidden>
+        <summary class="trail">Lost your passkeys?</summary>
+        <p>On the machine running the service, run <code>pingrail passkeys reset</code>. Then sign in with the password.</p>
+      </details>
+    </div>
+  </main>
+
+  <div class="signal" aria-hidden="true"><span class="signal__dot" data-dot></span></div>
+</div>
+<!--@end-->
+
+<!--@share-->
+<!-- A share link that stopped working while it was open -->
+<main id="closed" class="nowhere" hidden>
+  <p class="nowhere__code" id="closed-code" aria-hidden="true">410</p>
+  <h1 class="nowhere__title">This link has ended</h1>
+  <p class="nowhere__text" id="closed-msg"></p>
+  <div class="nowhere__rail" aria-hidden="true"><span class="nowhere__cut"></span></div>
+</main>
+<!--@end-->
+
+<!-- App -->
+<div id="app" class="app" tabindex="-1" hidden>
+  <header class="topbar">
+    <span class="wordmark"><svg class="mark" viewBox="18 15 32 45" aria-hidden="true" focusable="false"><path class="mark-rail" d="M22 31V56"/><circle class="mark-ring" cx="34" cy="31" r="12"/><circle class="mark-dot" cx="34" cy="31" r="4.2"/></svg>pingrail</span>
+    <nav class="windows" id="windows" aria-label="Time window"></nav>
+    <div class="topbar-actions">
+      <span id="conn" class="conn" role="status"></span>
+      <!--@export-->
+      <button id="export-open" class="quiet">Export report</button>
+      <!--@end-->
+      <button id="menu-open" class="quiet icon" aria-haspopup="menu" aria-expanded="false" aria-label="Menu"><span class="burger" aria-hidden="true"></span></button>
+      <div id="menu" class="menu" role="menu" hidden>
+        <!--@admin-->
+        <button role="menuitem" id="shares-open">Share links</button>
+        <!--@end-->
+        <button role="menuitem" id="theme-toggle">Switch to dark theme</button>
+        <!--@admin-->
+        <button role="menuitem" id="password-open">Change password</button>
+        <button role="menuitem" id="passkeys-open">Passkeys</button>
+        <button role="menuitem" id="phone-open">Set up a phone</button>
+        <!--@end-->
+        <button role="menuitem" id="about-open">About pingrail</button>
+        <!--@admin-->
+        <button role="menuitem" id="logout">Sign out</button>
+        <!--@end-->
+      </div>
+    </div>
+    <div class="app-rail" data-app-rail aria-hidden="true"><span class="rail__node"></span></div>
+  </header>
+
+  <section id="banner" class="banner" aria-label="Connection" aria-live="polite" hidden></section>
+  <!--@share-->
+  <section id="share-bar" class="share-bar" aria-label="About this shared view" hidden></section>
+  <!--@end-->
+
+  <div class="layout">
+    <aside class="targets" aria-label="Targets">
+      <ul id="target-list" class="target-list"></ul>
+      <!--@admin-->
+      <button id="add-open" class="add">Add target</button>
+      <!--@end-->
+      <!--@share-->
+      <!--@add-->
+      <button id="add-open" class="add">Add destination</button>
+      <!--@end-->
+      <!--@end-->
+    </aside>
+
+    <main id="detail" class="detail">
+      <section id="empty" class="empty" hidden>
+        <!--@admin-->
+        <h2>Nothing is being monitored yet</h2>
+        <p>Add a host name or IP address and pingrail will start pinging it and tracing its route.</p>
+        <div class="row">
+          <button class="primary" id="empty-add">Add target</button>
+          <button class="quiet" data-quick="1.1.1.1" data-name="Cloudflare DNS">Add 1.1.1.1</button>
+          <button class="quiet" data-quick="8.8.8.8" data-name="Google DNS">Add 8.8.8.8</button>
+        </div>
+        <!--@end-->
+        <!--@share-->
+        <h2>Nothing is shared on this link yet</h2>
+        <!--@add-->
+        <p>Add a host name or IP address and this monitor will start pinging it and tracing its route.</p>
+        <div class="row" id="empty-actions">
+          <button class="primary" id="empty-add">Add destination</button>
+        </div>
+        <!--@end-->
+        <p class="hint" id="empty-text">The person who shared this link hasn’t included any targets yet.</p>
+        <!--@end-->
+      </section>
+
+      <section id="target-view" hidden>
+        <div class="detail-head">
+          <div>
+            <h1 id="t-name"></h1>
+            <p id="t-meta" class="muted"></p>
+          </div>
+          <div class="row actions">
+            <!--@admin-->
+            <button id="t-share" class="quiet">Share</button>
+            <button id="t-bg" class="quiet" hidden>Keep running in background</button>
+            <!--@end-->
+            <!--@add-->
+            <button id="t-pause" class="quiet"></button>
+            <button id="t-edit" class="quiet">Edit</button>
+            <button id="t-remove" class="quiet danger">Remove</button>
+            <!--@end-->
+          </div>
+        </div>
+        <p id="t-error" class="error" hidden></p>
+
+        <div id="hop-bar" class="hop-bar">
+          <p id="hop-what">Pings to the destination</p>
+          <button id="hop-clear" class="quiet small" hidden>Show destination</button>
+        </div>
+
+        <dl id="t-stats" class="stats"></dl>
+
+        <div class="view-body">
+          <div class="measure">
+            <div class="chart-head">
+              <h2>Latency <span id="chart-sub" class="muted">in ms</span></h2>
+              <div class="row pan">
+                <button id="pan-back" class="quiet small" aria-label="Earlier">◀ Earlier</button>
+                <span id="range-label" class="muted small-text"></span>
+                <button id="pan-fwd" class="quiet small" aria-label="Later">Later ▶</button>
+                <button id="pan-live" class="quiet small">Live</button>
+              </div>
+            </div>
+            <div class="chart-wrap">
+              <canvas id="chart" class="chart" role="img" aria-label="Latency over time"></canvas>
+              <canvas id="loss" class="loss" role="img" aria-label="Packet loss over time"></canvas>
+              <div id="tooltip" class="tooltip" hidden></div>
+            </div>
+            <p id="legend" class="legend muted"><span class="key-line"></span> <span id="legend-avg">average</span> <span id="legend-spread-key" class="key-band"></span> <span id="legend-spread">lowest to highest</span> <span class="key-loss"></span> <span id="legend-loss">packet loss</span> <span class="key-gap"></span> no samples</p>
+            <p id="chart-caption" class="hint"></p>
+          </div>
+
+          <section id="route" class="route" aria-labelledby="route-title">
+            <h2 id="route-title">Route <span id="route-sub" class="muted"></span></h2>
+            <p id="route-reading" class="route-reading" hidden></p>
+            <div class="route-scroll">
+              <canvas id="route-graph" class="route-graph" aria-hidden="true" hidden></canvas>
+              <table id="route-table">
+                <thead>
+                  <tr>
+                    <th class="rail-col" scope="col"><span class="sr">Hop</span></th>
+                    <th scope="col">Address</th>
+                    <th scope="col" class="num">Loss %</th>
+                    <th scope="col" class="num">Avg</th>
+                    <th scope="col" class="num extra">Min</th>
+                    <th scope="col" class="num extra">Max</th>
+                    <th scope="col" class="num extra">Jitter</th>
+                    <th scope="col" class="bar-col">Latency <span id="route-scale" class="muted"></span></th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <p class="hint route-key"><span class="k"><span class="rk-hatch"></span>loss reaching the destination, from the hop where it starts</span> <span class="k"><span class="rk-limit"></span>limits its replies</span> <span class="k"><span class="rk-silent"></span>no reply</span></p>
+            <p class="hint route-key"><span class="k"><span class="rk-bar"></span>now</span> <span class="k"><span class="rk-tick"></span>lowest</span> <span class="k"><span class="rk-dot"></span>average</span> <span class="k"><span class="rk-whisker"></span>highest</span></p>
+            <p class="hint">Select a hop to graph its latency. Route figures come from trace probes, separate from the pings above, so the destination’s loss can differ a little.</p>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<!--@add-->
+<!-- Add / edit target -->
+<dialog id="target-dialog">
+  <form id="target-form" method="dialog">
+    <!--@admin-->
+    <h2 id="target-dialog-title">Add target</h2>
+    <!--@end-->
+    <!--@share-->
+    <h2 id="target-dialog-title">Add destination</h2>
+    <!--@end-->
+    <label>Host name or IP address <input name="host" required placeholder="8.8.8.8 or vpn.example.com" autocomplete="off" spellcheck="false"></label>
+    <label><span>Name <span class="muted">(optional)</span></span> <input name="name" autocomplete="off"></label>
+    <label>Seconds between samples <input name="interval" type="number" min="0.25" max="3600" step="0.25" value="2.5"></label>
+    <label class="check"><input name="trace" type="checkbox" checked> Trace the route and record every hop</label>
+    <!--@admin-->
+    <p class="hint">Targets added here keep running in the background.</p>
+    <!--@end-->
+    <!--@share-->
+    <p class="hint" id="target-hint">The owner of this monitor can see destinations you add. They stop when this link ends.</p>
+    <!--@end-->
+    <p class="error" id="target-error" role="alert"></p>
+    <div class="row end">
+      <button type="button" class="quiet" data-close>Cancel</button>
+      <button type="submit" class="primary" id="target-save">Add target</button>
+    </div>
+  </form>
+</dialog>
+<!--@end-->
+
+<!--@export-->
+<!-- Export -->
+<dialog id="export-dialog">
+  <form id="export-form" method="dialog">
+    <h2>Export report</h2>
+    <fieldset>
+      <legend>Time range</legend>
+      <div class="segmented" id="export-ranges">
+        <label><input type="radio" name="range" value="view" checked> Current view</label>
+        <label><input type="radio" name="range" value="3600000"> Last hour</label>
+        <label><input type="radio" name="range" value="86400000"> Last 24 hours</label>
+        <label><input type="radio" name="range" value="604800000"> Last 7 days</label>
+        <label><input type="radio" name="range" value="custom"> Custom</label>
+      </div>
+      <div class="row custom-range" id="custom-range" hidden>
+        <label>From <input type="datetime-local" name="from" step="60"></label>
+        <label>To <input type="datetime-local" name="to" step="60"></label>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>Targets</legend>
+      <div id="export-targets" class="export-targets"></div>
+    </fieldset>
+    <fieldset>
+      <legend>Format</legend>
+      <div class="segmented">
+        <label><input type="radio" name="format" value="pdf" checked> PDF</label>
+        <label><input type="radio" name="format" value="png"> PNG image</label>
+      </div>
+    </fieldset>
+    <p class="error" id="export-error" role="alert"></p>
+    <div class="row end">
+      <button type="button" class="quiet" data-close>Cancel</button>
+      <button type="submit" class="primary" id="export-go">Download report</button>
+    </div>
+  </form>
+</dialog>
+<!--@end-->
+
+<!--@admin-->
+<!-- Password -->
+<dialog id="password-dialog">
+  <form id="password-form" method="dialog">
+    <h2>Change password</h2>
+    <label>New password <input name="p1" type="password" minlength="8" required autocomplete="new-password"></label>
+    <label>Repeat it <input name="p2" type="password" minlength="8" required autocomplete="new-password"></label>
+    <p class="hint">Changing the password signs you out on other devices.</p>
+    <p class="error" id="password-error" role="alert"></p>
+    <div class="row end">
+      <button type="button" class="quiet" data-close>Cancel</button>
+      <button type="submit" class="primary">Change password</button>
+    </div>
+  </form>
+</dialog>
+<!--@end-->
+
+<!--@admin-->
+<!-- Passkeys -->
+<dialog id="passkeys-dialog" class="wide" aria-labelledby="pk-title">
+  <div class="dialog-body">
+    <h2 id="pk-title">Passkeys</h2>
+    <p class="hint">Sign in with your phone, a security key or this computer’s screen lock instead of the password.</p>
+    <div class="warn-note" id="pk-unavailable" hidden></div>
+    <form id="pk-confirm" class="confirm" hidden>
+      <p>Confirm it’s you before changing how you sign in.</p>
+      <div class="row" id="pk-confirm-pw">
+        <label class="grow">Password <input name="password" type="password" autocomplete="current-password" required></label>
+        <button type="submit" class="primary">Confirm</button>
+      </div>
+      <p><button type="button" class="trail" id="pk-confirm-passkey">Confirm with a passkey instead</button></p>
+    </form>
+    <ul id="pk-list" class="share-list"></ul>
+    <form id="pk-add" class="row add-row" hidden>
+      <label class="grow">Name <input name="label" maxlength="40" autocomplete="off" placeholder="iPhone"></label>
+      <button type="submit" class="primary" id="pk-add-go">Add a passkey</button>
+    </form>
+    <div id="pk-require-row" hidden>
+      <label class="check"><input type="checkbox" id="pk-required"> Require a passkey to sign in</label>
+      <p class="hint indent">The password stops working for signing in. Lost every passkey? Run <code>pingrail passkeys reset</code> on the machine running the service.</p>
+    </div>
+    <p class="error" id="pk-error" role="alert"></p>
+    <div class="row end">
+      <button type="button" class="quiet" data-close>Close</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- Set up a phone: trust this server, then open pingrail -->
+<dialog id="phone-dialog" class="wide phone" aria-labelledby="phone-title">
+  <div class="dialog-body">
+    <h2 id="phone-title">Set up a phone</h2>
+    <p class="hint" id="phone-intro">Point the phone’s camera at each code in turn.</p>
+    <div class="warn-note" id="phone-note" hidden></div>
+    <label id="phone-host-row" hidden>Open pingrail as <select id="phone-host"></select></label>
+    <ol class="stations">
+      <li class="station" id="station-trust">
+        <h3 class="station__title"><span class="station__no" aria-hidden="true">1</span>Trust this server</h3>
+        <figure class="qr"><img id="qr-ca" alt="" width="288" height="288"><figcaption class="qr__url" id="qr-ca-url"></figcaption></figure>
+        <p class="station__text">The phone warns the connection isn’t private: that’s expected until this step is done. Continue, download the certificate and check its fingerprint matches.</p>
+        <p class="fp"><span class="fp__label">SHA-256</span><span class="fp__value" id="phone-fp"></span></p>
+        <details class="howto">
+          <summary class="trail">iPhone and iPad</summary>
+          <p>Allow the download, then open Settings › General › VPN &amp; Device Management to install it. Then turn it on in Settings › General › About › Certificate Trust Settings.</p>
+        </details>
+        <details class="howto">
+          <summary class="trail">Android</summary>
+          <p>Open Settings › Security › More security settings › Encryption &amp; credentials › Install a certificate › CA certificate, and choose the downloaded file. (Menu names vary a little by phone.)</p>
+        </details>
+      </li>
+      <li class="station" id="station-open">
+        <h3 class="station__title"><span class="station__no" aria-hidden="true">2</span>Open pingrail</h3>
+        <figure class="qr"><img id="qr-app" alt="" width="288" height="288"><figcaption class="qr__url" id="qr-app-url"></figcaption></figure>
+        <p class="station__text">Sign in, then add a passkey from the menu (Passkeys) so the phone can sign in with its screen lock.</p>
+      </li>
+    </ol>
+    <p class="error" id="phone-error" role="alert"></p>
+    <div class="row end">
+      <button type="button" class="quiet" data-close>Close</button>
+    </div>
+  </div>
+</dialog>
+<!--@end-->
+
+<!--@add-->
+<!-- Confirm remove -->
+<dialog id="remove-dialog">
+  <form method="dialog">
+    <h2>Remove <span id="remove-name">this target</span>?</h2>
+    <p>This stops monitoring it and deletes its history.</p>
+    <div class="row end">
+      <button value="cancel" class="quiet">Keep it</button>
+      <button value="remove" class="primary danger-fill" id="remove-go">Remove</button>
+    </div>
+  </form>
+</dialog>
+<!--@end-->
+
+<!--@admin-->
+<!-- Confirm something -->
+<dialog id="confirm-dialog">
+  <form method="dialog">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-body"></p>
+    <div class="row end">
+      <button value="cancel" class="quiet">Cancel</button>
+      <button value="ok" class="primary" id="confirm-go"></button>
+    </div>
+  </form>
+</dialog>
+<!--@end-->
+
+<!--@admin-->
+<!-- Share links list -->
+<dialog id="shares-dialog" class="wide">
+  <div class="dialog-body">
+    <div class="row between">
+      <h2>Share links</h2>
+      <button type="button" class="primary" id="share-new">New share link</button>
+    </div>
+    <p class="hint">People with a link see only the targets you chose, without signing in. Switch a link off at any time.</p>
+    <p class="hint warn-note" id="share-url-note" hidden></p>
+    <ul id="share-list" class="share-list"></ul>
+    <div class="row end">
+      <button type="button" class="quiet" data-close>Close</button>
+    </div>
+  </div>
+</dialog>
+<!--@end-->
+
+<!--@admin-->
+<!-- Create / edit a share link -->
+<dialog id="share-dialog" class="wide">
+  <form id="share-form" method="dialog">
+    <h2 id="share-dialog-title">New share link</h2>
+    <fieldset>
+      <legend>Start from</legend>
+      <div class="segmented" id="share-presets">
+        <label><input type="radio" name="preset" value="public"> Public, view only</label>
+        <label><input type="radio" name="preset" value="isp"> ISP / support</label>
+      </div>
+    </fieldset>
+    <label><span>Label <span class="muted">(only you see this)</span></span> <input name="label" maxlength="80" placeholder="ISP ticket 48213" autocomplete="off"></label>
+    <fieldset>
+      <legend>Targets to show</legend>
+      <div id="share-targets" class="export-targets"></div>
+    </fieldset>
+    <fieldset>
+      <legend>Visitors can</legend>
+      <div class="share-perm">
+        <label class="check"><input type="checkbox" name="can_add"> Add, change and remove their own destinations, up to</label>
+        <input name="max_targets" type="number" min="1" max="20" value="5" class="tiny" aria-label="Most destinations a visitor can add">
+      </div>
+      <label id="allow-private-row" class="indent" hidden><span>Private addresses they may add <span class="muted">(optional, e.g. 192.168.1.0/24)</span></span>
+        <input name="allow_private" autocomplete="off" spellcheck="false" placeholder="Public destinations only">
+      </label>
+      <label class="check"><input type="checkbox" name="can_export"> Download PDF and PNG reports</label>
+    </fieldset>
+    <fieldset id="visitor-limits">
+      <legend>Destinations visitors add</legend>
+      <div class="limits">
+        <label><span>Fastest interval</span>
+          <span class="unit"><input name="min_interval" type="number" min="0.25" max="3600" step="0.25" value="2.5" class="tiny" aria-label="Fastest interval in seconds"> s</span></label>
+        <label><span>Keep their samples</span>
+          <span class="unit"><input name="visitor_retention_days" type="number" min="0" max="3650" value="0" class="tiny" aria-label="Days to keep visitors' samples"> days</span></label>
+        <label><span>Disk space limit</span>
+          <span class="unit"><input name="visitor_storage_mb" type="number" min="0" max="10000000" value="1024" class="tiny" aria-label="Storage limit in MB"> MB</span></label>
+      </div>
+      <p class="hint">0 days keeps them as long as your own targets; 0 MB means no limit. At the limit their destinations pause until older samples age out. All visitor destinations also pause when the disk runs low.</p>
+    </fieldset>
+    <fieldset>
+      <legend>History they can see</legend>
+      <div class="segmented">
+        <label><input type="radio" name="history" value="all" checked> Everything stored</label>
+        <label><input type="radio" name="history" value="days"> Last <input name="history_days" type="number" min="1" max="365" value="7" class="tiny" aria-label="Days of history"> days</label>
+        <label><input type="radio" name="history" value="since"> Only from now on</label>
+      </div>
+    </fieldset>
+    <fieldset>
+      <legend>Privacy</legend>
+      <label class="check"><input type="checkbox" name="hide_private" checked> <span>Hide private hops <span class="muted">(your LAN shows as “private network”)</span></span></label>
+      <div class="share-perm">
+        <span>Hide the first</span>
+        <input name="hide_public_hops" type="number" min="0" max="10" value="0" class="tiny" aria-label="Public hops to hide">
+        <span>public hops <span class="muted">(they reveal your ISP and area)</span></span>
+      </div>
+      <label class="check"><input type="checkbox" name="hide_hostnames"> Hide hop host names</label>
+      <p class="hint">Each shared target’s own name and address are always shown.</p>
+    </fieldset>
+    <fieldset>
+      <legend>Link works for</legend>
+      <div class="segmented" id="share-expiry">
+        <label><input type="radio" name="expiry" value="keep"> Keep current</label>
+        <label><input type="radio" name="expiry" value="never" checked> No limit</label>
+        <label><input type="radio" name="expiry" value="86400000"> 24 hours</label>
+        <label><input type="radio" name="expiry" value="604800000"> 7 days</label>
+        <label><input type="radio" name="expiry" value="2592000000"> 30 days</label>
+        <label><input type="radio" name="expiry" value="custom"> Until</label>
+      </div>
+      <input type="datetime-local" name="expires_at" step="60" id="share-expires-at" hidden aria-label="Expiry date and time">
+    </fieldset>
+    <p class="error" id="share-error" role="alert"></p>
+    <div class="row end">
+      <button type="button" class="quiet" data-close>Cancel</button>
+      <button type="submit" class="primary" id="share-save">Create link</button>
+    </div>
+  </form>
+</dialog>
+<!--@end-->
+
+<!-- About -->
+<dialog id="about-dialog">
+  <div class="dialog-body about">
+    <div class="about-head">
+      <svg class="about-logo" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><rect class="tile" width="32" height="32" rx="7.5"/><path class="tile-rail" d="M10 15.5V28"/><circle class="tile-ring" cx="16.8" cy="15.5" r="6.6"/><circle class="tile-dot" cx="16.8" cy="15.5" r="2.5"/></svg>
+      <div>
+        <h2>{{about.name}}</h2>
+        <p class="muted">Version {{about.version}} · {{about.publisher}}</p>
+      </div>
+    </div>
+    <p>{{about.copyright}}. Licensed under the Apache License, version 2.0 ({{about.license}}).</p>
+    <p class="hint">{{about.notice}}</p>
+    <p class="hint">{{about.trademark}}</p>
+    <p class="about-links"><a href="/about/license.txt" target="_blank" rel="noopener">Apache License 2.0</a> · <a href="/about/third-party.txt" target="_blank" rel="noopener">Third-party notices</a> · <a href="{{about.contact}}" target="_blank" rel="noopener">Questions and bug reports</a></p>
+    <div class="row end">
+      <button type="button" class="quiet" data-close>Close</button>
+    </div>
+  </div>
+</dialog>
+
+<div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>
