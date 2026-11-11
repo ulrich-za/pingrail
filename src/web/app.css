@@ -507,6 +507,7 @@ label.check { display: flex; gap: 0.5rem; align-items: center; color: var(--ink)
   content: ""; position: absolute; left: 13px; top: 1.15em; width: 8px; height: 8px;
   border: 2px solid currentColor; border-radius: 50%;
 }
+.notice a { color: inherit; font-weight: 640; text-underline-offset: 2px; }
 
 .form { display: grid; gap: 18px; }
 .field { display: grid; gap: 8px; }
@@ -811,6 +812,22 @@ label.check { display: flex; gap: 0.5rem; align-items: center; color: var(--ink)
   font-variant-numeric: tabular-nums;
 }
 .tooltip .t { color: var(--ink-2); margin-bottom: 0.2rem; }
+.tooltip .t:not(:first-child) { margin-top: 0.5rem; }
+.tooltip .what { margin: 0 0 0.2rem; color: var(--ink); }
+/* Marks on the time axis: something happened to the target (its name
+   resolved to another address). The tip touches the axis; the button is
+   big enough to point at or tap. */
+.marks { position: absolute; inset: 0; pointer-events: none; }
+.event-mark {
+  position: absolute; width: 24px; height: 24px; margin: 0 0 0 -12px; padding: 0;
+  border: 0; border-radius: 0; background: none; box-shadow: none; pointer-events: auto; cursor: help;
+}
+.event-mark::before {
+  content: ""; position: absolute; left: 6px; top: 0;
+  border-left: 6px solid transparent; border-right: 6px solid transparent; border-bottom: 10px solid var(--ink);
+}
+.event-mark:hover::before, .event-mark:focus-visible::before { border-bottom-color: var(--ink-2); }
+.event-mark:focus-visible { outline-offset: 1px; }
 .tooltip .r { display: flex; justify-content: space-between; gap: 1rem; }
 .tooltip strong { font-family: var(--mono); font-weight: 400; font-size: 0.95em; }
 .legend { font-size: 0.8rem; display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap; }
@@ -821,6 +838,7 @@ label.check { display: flex; gap: 0.5rem; align-items: center; color: var(--ink)
 .key-loss { width: 4px; height: 11px; background: var(--crit); outline: 1px solid var(--edge); margin-left: 0.6rem; }
 .legend.is-unanswered .key-loss { background: var(--ink-3); outline-color: transparent; }
 .key-gap { width: 14px; height: 9px; background: var(--gap); border: 1px solid var(--line); margin-left: 0.6rem; }
+.key-mark { width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent; border-bottom: 8px solid var(--ink); margin-left: 0.6rem; }
 #chart-caption { margin-top: -0.6rem; }
 
 /* What the stats describe: pings to the destination, or trace probes to the

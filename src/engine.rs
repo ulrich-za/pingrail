@@ -42,6 +42,7 @@ fn task_key(t: &Target) -> TaskKey {
 }
 
 struct Ctx {
+    store: Arc<Store>,
     prober: Arc<Prober>,
     cfg: ProbeConfig,
     live: Arc<RwLock<HashMap<i64, LiveStatus>>>,
@@ -75,7 +76,7 @@ impl VisitorGuard {
 }
 
 fn fmt_mb(mb: u32) -> String {
-    if mb >= 1024 && mb % 1024 == 0 { format!("{} GB", mb / 1024) } else { format!("{mb} MB") }
+    if mb >= 1024 && mb.is_multiple_of(1024) { format!("{} GB", mb / 1024) } else { format!("{mb} MB") }
 }
 
 pub struct Engine {
@@ -116,8 +117,8 @@ impl Engine {
             cfg.storage.min_free_mb,
         ));
         let engine = Arc::new(Engine {
-            store,
             ctx: Arc::new(Ctx {
+                store: store.clone(),
                 prober,
                 cfg: cfg.probe.clone(),
                 live: Arc::new(RwLock::new(HashMap::new())),
@@ -128,6 +129,7 @@ impl Engine {
             writer: Mutex::new(Some(writer)),
             rdns: Arc::new(Rdns::new(cfg.probe.reverse_dns)),
             storage_check,
+            store,
         });
         engine.sync().await?;
         Ok(engine)
@@ -219,7 +221,7 @@ async fn visitor_storage_loop(
                 }
             }
         }
-        if forced || tick % 5 == 0 {
+        if forced || tick.is_multiple_of(5) {
             let now = now_ms();
             let r = blocking(&store, move |s| {
                 let mut full = HashMap::new();
@@ -277,22 +279,46 @@ async fn writer_loop(store: Arc<Store>, mut rx: mpsc::UnboundedReceiver<RoundRec
 
 /// Resolve a host, preferring IPv4 unless an IPv6 literal was given.
 pub async fn resolve(host: &str) -> Result<IpAddr> {
+    Ok(pick(&resolve_all(host).await?, None))
+}
+
+/// Every address a host resolves to (just the address, for an IP literal).
+async fn resolve_all(host: &str) -> Result<Vec<IpAddr>> {
     let h = host.trim().trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = h.parse::<IpAddr>() {
-        return Ok(ip);
+        return Ok(vec![ip]);
     }
-    let addrs: Vec<IpAddr> = tokio::net::lookup_host((h, 0)).await?.map(|a| a.ip()).collect();
-    addrs
-        .iter()
-        .find(|a| a.is_ipv4())
-        .or_else(|| addrs.first())
-        .copied()
-        .ok_or_else(|| anyhow::anyhow!("no addresses for {h}"))
+    let mut addrs: Vec<IpAddr> = tokio::net::lookup_host((h, 0)).await?.map(|a| a.ip()).collect();
+    addrs.dedup();
+    if addrs.is_empty() {
+        anyhow::bail!("no addresses for {h}");
+    }
+    Ok(addrs)
+}
+
+/// Which address to probe: `current` while the name still resolves to it
+/// (a name with several addresses, handed out in turn, would otherwise hop
+/// between them), else the first IPv4 address, else the first.
+fn pick(addrs: &[IpAddr], current: Option<IpAddr>) -> IpAddr {
+    if let Some(c) = current
+        && addrs.contains(&c)
+    {
+        return c;
+    }
+    addrs.iter().find(|a| a.is_ipv4()).or_else(|| addrs.first()).copied().unwrap_or(IpAddr::from([0, 0, 0, 0]))
 }
 
 async fn target_loop(t: Target, ctx: Arc<Ctx>) {
     let route = Arc::new(Mutex::new(RouteState::default()));
     let mut resolved: Option<(IpAddr, Instant)> = None;
+    // What the name resolved to before this task began (saved), so a change
+    // while pingrail was stopped or the target paused is noticed too.
+    let id = t.id;
+    let mut before: Option<IpAddr> = blocking(&ctx.store, move |s| s.target_last_ip(id))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|a| a.parse().ok());
     let mut ticker = tokio::time::interval(Duration::from_millis(t.interval_ms.max(250) as u64));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -309,11 +335,25 @@ async fn target_loop(t: Target, ctx: Arc<Ctx>) {
         }
         let stale = resolved.is_none_or(|(_, at)| at.elapsed() > Duration::from_secs(300));
         if stale {
-            match resolve(&t.host).await {
-                Ok(ip) => {
+            match resolve_all(&t.host).await {
+                Ok(addrs) => {
+                    let prev = resolved.map(|r| r.0).or(before);
+                    let ip = pick(&addrs, prev);
                     if resolved.map(|r| r.0) != Some(ip) {
                         // New address: rediscover the route.
                         *route.lock().unwrap() = RouteState::default();
+                    }
+                    if prev != Some(ip) {
+                        // Saved, and marked on the timeline when it changed.
+                        let (old, new) = (prev.map(|a| a.to_string()), ip.to_string());
+                        if let Some(o) = &old {
+                            tracing::info!("{} now resolves to {new} (was {o})", t.host);
+                        }
+                        let r = blocking(&ctx.store, move |s| s.record_address(id, ts, old.as_deref(), &new)).await;
+                        if let Err(e) = r {
+                            tracing::warn!("saving the address of {}: {e:#}", t.host);
+                        }
+                        before = Some(ip);
                     }
                     resolved = Some((ip, Instant::now()));
                 }
@@ -545,5 +585,21 @@ impl Rdns {
             });
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picking_an_address_sticks_while_it_is_offered() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let both = [ip("2001:db8::7"), ip("192.0.2.7"), ip("192.0.2.8")];
+        assert_eq!(pick(&both, None), ip("192.0.2.7"), "IPv4 first");
+        assert_eq!(pick(&both, Some(ip("192.0.2.8"))), ip("192.0.2.8"), "the current one, while offered");
+        assert_eq!(pick(&both, Some(ip("2001:db8::7"))), ip("2001:db8::7"));
+        assert_eq!(pick(&both, Some(ip("198.51.100.1"))), ip("192.0.2.7"), "gone: the preferred one");
+        assert_eq!(pick(&[ip("2001:db8::9")], Some(ip("192.0.2.7"))), ip("2001:db8::9"));
     }
 }

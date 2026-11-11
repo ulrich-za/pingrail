@@ -9,7 +9,7 @@ use crate::ca::Certs;
 use crate::config::{load_or_create_token, random_hex, Config, Paths};
 use crate::engine::Engine;
 use crate::probe::Prober;
-use crate::server::{self, AppState};
+use crate::server::{self, St};
 use crate::store::Store;
 
 /// Run the service until `shutdown` resolves.
@@ -63,8 +63,9 @@ pub async fn run(
     } else {
         tracing::info!("certificate for {} from pingrail's certificate authority, SHA-256 {fp}", info.names.join(", "));
     }
-    let passwords = crate::password::start(&store).await?;
-    let state = AppState::new(store.clone(), engine.clone(), cfg, token, listen, certs, passwords);
+    let port = listener.local_addr()?.port();
+    let auth = crate::auth::Auth::start(&paths.db_file(), &store, &certs, crate::auth::Settings::new(&cfg, port)).await?;
+    let state = St::new(store.clone(), engine.clone(), cfg, token, listen, certs, auth);
     server::serve(state, listener, share_listener, tls, shutdown).await?;
     tracing::info!("shutting down");
     engine.shutdown().await;
@@ -101,8 +102,9 @@ impl Embedded {
         let addr = listener.local_addr()?;
         let token = random_hex(32);
         let fingerprint = certs.pin();
-        let passwords = crate::password::start(&store).await?;
-        let state = AppState::new(store, engine.clone(), cfg, token.clone(), addr.to_string(), certs, passwords);
+        let auth =
+            crate::auth::Auth::start(&paths.db_file(), &store, &certs, crate::auth::Settings::new(&cfg, addr.port())).await?;
+        let state = St::new(store, engine.clone(), cfg, token.clone(), addr.to_string(), certs, auth);
         let (tx, rx) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
             server::serve(state, listener, None, tls, async move {

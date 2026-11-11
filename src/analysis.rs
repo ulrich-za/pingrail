@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use crate::engine::Rdns;
-use crate::model::{Detail, HopReading, HopStat, LiveStatus, Overview, Target, TargetOverview, Thresholds};
+use crate::model::{Detail, HopReading, HopStat, LiveStatus, Overview, Target, TargetEvent, TargetOverview, Thresholds};
 use crate::stats::{bucketize, compute, timeline, Running};
 use crate::store::{HopKind, HopRecord, Sample, Store};
 
@@ -184,9 +184,46 @@ pub fn detail_scoped(
     };
     let stats = compute(rows.iter().map(|r| r.1));
     let tl = timeline(&rows, from, to, max_points, target.interval_ms);
+    let events = events(store, &target, &rows, data_from, to, scope.privacy)?;
     apply_privacy(&mut hops, scope.privacy);
     let target = if scope.ids.is_some() { public_target(target) } else { target };
-    Ok(Detail { target, live, stats, hops, hop, timeline: tl })
+    Ok(Detail { target, live, stats, hops, hop, timeline: tl, events })
+}
+
+/// Most changes marked on one timeline.
+const MAX_EVENTS: usize = 200;
+
+/// What happened to the target in `[from, to)`, each with the average round
+/// trip of what is graphed (`rows`, in time order) in the few minutes
+/// before and after it.
+fn events(store: &Store, target: &Target, rows: &[Sample], from: i64, to: i64, privacy: Privacy) -> Result<Vec<TargetEvent>> {
+    let mut events = store.target_events(target.id, from, to, MAX_EVENTS)?;
+    let span = (10 * target.interval_ms as i64).max(300_000);
+    for e in &mut events {
+        e.before_ms = mean_rtt(rows, e.ts_ms - span, e.ts_ms);
+        e.after_ms = mean_rtt(rows, e.ts_ms, e.ts_ms + span);
+        if privacy.hide_private {
+            for a in [&mut e.from, &mut e.to] {
+                if a.as_deref().and_then(|s| s.parse::<IpAddr>().ok()).is_some_and(crate::netpolicy::is_private) {
+                    *a = Some("a private address".into());
+                }
+            }
+        }
+    }
+    Ok(events)
+}
+
+/// Average round trip of the samples in `[from, to)` that got a reply.
+fn mean_rtt(rows: &[Sample], from: i64, to: i64) -> Option<f64> {
+    let start = rows.partition_point(|r| r.0 < from);
+    let (mut sum, mut n) = (0.0, 0u32);
+    for r in rows[start..].iter().take_while(|r| r.0 < to) {
+        if let Some(ms) = r.1 {
+            sum += ms;
+            n += 1;
+        }
+    }
+    (n > 0).then(|| sum / n as f64)
 }
 
 /// Work out what each hop's loss means (see [`HopReading`]).
@@ -329,6 +366,40 @@ impl HopAcc {
 mod tests {
     use super::*;
     use crate::model::Stats;
+
+    #[test]
+    fn address_changes_come_with_latency_before_and_after() {
+        let dir = std::env::temp_dir().join(format!("pingrail-test-{}", crate::config::random_hex(4)));
+        let s = Store::open(&dir.join("t.db")).unwrap();
+        let t = s.add_target(&crate::model::NewTarget { host: "cdn.example.com".into(), trace: Some(false), ..Default::default() }, 1000).unwrap();
+        // 20 ms for ten minutes, then 2 ms after the change at 600 s.
+        let rows: Vec<crate::store::RoundRecord> = (0..1200)
+            .map(|i| crate::store::RoundRecord {
+                target_id: t.id,
+                ts_ms: i * 1000,
+                interval_ms: 1000,
+                rtt_us: Some(if i < 600 { 20_000 } else { 2_000 }),
+                hops: None,
+            })
+            .collect();
+        s.insert_rounds(&rows).unwrap();
+        s.record_address(t.id, 0, None, "10.0.0.7").unwrap();
+        s.record_address(t.id, 600_000, Some("10.0.0.7"), "203.0.113.10").unwrap();
+        let d = detail(&s, t.clone(), LiveStatus::default(), None, 0, 1_200_000, 400, None, Thresholds::default()).unwrap();
+        assert_eq!(d.events.len(), 1);
+        let e = &d.events[0];
+        assert_eq!((e.from.as_deref(), e.to.as_deref()), (Some("10.0.0.7"), Some("203.0.113.10")));
+        assert_eq!((e.before_ms, e.after_ms), (Some(20.0), Some(2.0)));
+        // A share link that hides private addresses hides them here too.
+        let scope = Scope { privacy: Privacy { hide_private: true, ..Default::default() }, ..Default::default() };
+        let d = detail_scoped(&s, t.clone(), LiveStatus::default(), None, 0, 1_200_000, 400, None, Thresholds::default(), &scope).unwrap();
+        assert_eq!(d.events[0].from.as_deref(), Some("a private address"));
+        assert_eq!(d.events[0].to.as_deref(), Some("203.0.113.10"));
+        // Not in the window shown, not listed.
+        let d = detail(&s, t, LiveStatus::default(), None, 700_000, 1_200_000, 400, None, Thresholds::default()).unwrap();
+        assert!(d.events.is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     fn hop(ttl: u8, addr: &str, us: u32, kind: HopKind) -> HopRecord {
         HopRecord { ttl, addr: Some(addr.parse().unwrap()), rtt_us: Some(us), kind }

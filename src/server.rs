@@ -2,12 +2,12 @@
 //!
 //! Authentication: either `Authorization: Bearer <api token>` (used by the TUI
 //! and CLI on the same machine; the token lives in the service's data
-//! directory) or a session cookie obtained by logging in with the web
-//! username/password.
+//! directory) or a doorward session, signed in with a password or a passkey
+//! through `/auth/…` (see `auth`).
 
 use anyhow::Result;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, FromRef, FromRequestParts, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -23,23 +23,9 @@ use crate::analysis;
 use crate::config::{now_ms, random_hex, Config};
 use crate::engine::{resolve, Engine};
 use crate::model::*;
-use crate::password::{Check, HashError, Passwords};
 use crate::report::{self, ReportRequest};
 use crate::store::{blocking, Store};
 
-/// The __Host- prefix makes browsers insist on Secure, Path=/ and no Domain.
-const COOKIE: &str = "__Host-pr_session";
-/// Password checks are deliberately expensive (see `password`), so only one
-/// or two run at once, and sign-in attempts from everyone together are
-/// rate-limited (burst, then per second), on top of the per-address
-/// slow-down and lockout.
-const LOGIN_BURST: f64 = 20.0;
-const LOGIN_REFILL_PER_SEC: f64 = 0.5;
-/// Failed sign-ins from one address within 15 minutes before it is refused
-/// for 15 minutes, and how many addresses are tracked at most.
-const LOGIN_LOCKOUT_FAILURES: u32 = 20;
-const LOGIN_LOCKOUT: Duration = Duration::from_secs(900);
-const LOGIN_TRACKED_MAX: usize = 10_000;
 /// A TUI session that has not sent a heartbeat for this long is ended and
 /// its foreground targets are paused.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -51,10 +37,8 @@ pub struct AppState {
     pub token: String,
     pub listen: String,
     tui_sessions: Mutex<HashMap<String, Instant>>,
-    login_failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
-    pub passwords: Passwords,
-    pub ceremonies: crate::passkeys::Ceremonies,
-    login_budget: Mutex<HashMap<(), (f64, Instant)>>,
+    /// Signing in (doorward).
+    pub auth: Arc<crate::auth::Auth>,
     /// The certificate this service presents, and its authority.
     pub certs: Arc<crate::ca::Certs>,
     /// SHA-256 fingerprint of what clients pin (the authority).
@@ -64,7 +48,7 @@ pub struct AppState {
     pub trusted: Vec<(IpAddr, u8)>,
 }
 
-impl AppState {
+impl St {
     pub fn new(
         store: Arc<Store>,
         engine: Arc<Engine>,
@@ -72,55 +56,59 @@ impl AppState {
         token: String,
         listen: String,
         certs: Arc<crate::ca::Certs>,
-        passwords: Passwords,
-    ) -> Arc<AppState> {
+        auth: Arc<crate::auth::Auth>,
+    ) -> St {
         let cfg_trusted = cfg.share.trusted_proxies.clone();
-        Arc::new(AppState {
+        St(Arc::new(AppState {
             store,
             engine,
             cfg,
             token,
             listen,
             tui_sessions: Mutex::new(HashMap::new()),
-            login_failures: Mutex::new(HashMap::new()),
-            passwords,
-            ceremonies: Default::default(),
-            login_budget: Mutex::new(HashMap::new()),
+            auth,
             cert_sha256: crate::tls::fmt_fingerprint(&certs.pin()),
             certs,
             share: crate::share::ShareState::default(),
             trusted: crate::http::parse_nets(&cfg_trusted),
-        })
+        }))
     }
 }
 
-pub type St = Arc<AppState>;
+/// The routers' state.
+#[derive(Clone)]
+pub struct St(pub Arc<AppState>);
+
+impl std::ops::Deref for St {
+    type Target = AppState;
+    fn deref(&self) -> &AppState {
+        &self.0
+    }
+}
+
+/// doorward's extractors and endpoints find the doorkeeper this way: the one
+/// the request started with.
+impl FromRef<St> for doorward::Doorward {
+    fn from_ref(st: &St) -> doorward::Doorward {
+        crate::auth::dw(st)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Principal {
     pub user: String,
     pub via: &'static str,
-    /// When this user last signed in or confirmed it was them (ms).
-    pub auth_ms: i64,
+    /// The doorward session, when signed in through the web UI.
+    pub session: Option<doorward::axum::Authenticated>,
+    /// Signed in (or confirmed it was them) in the last ten minutes.
+    recent: bool,
 }
-
-/// Changes to how you sign in need a sign-in within this long.
-pub const RECENT_MS: i64 = 10 * 60_000;
 
 impl Principal {
     /// Signed in recently enough to change sign-in settings (the API token
     /// always is: it's this machine).
     pub fn recent(&self) -> bool {
-        self.via == "token" || now_ms() - self.auth_ms < RECENT_MS
-    }
-}
-
-/// Refuse unless `p` signed in within the last ten minutes.
-pub fn need_recent(p: &Principal) -> ApiResult<()> {
-    if p.recent() {
-        Ok(())
-    } else {
-        Err(ApiError(StatusCode::FORBIDDEN, "confirm it's you first".into()))
+        self.via == "token" || self.recent
     }
 }
 
@@ -154,7 +142,6 @@ pub type ApiResult<T> = std::result::Result<T, ApiError>;
 pub fn router(state: St) -> Router {
     let api = Router::new()
         .route("/api/me", get(me))
-        .route("/api/logout", post(logout))
         .route("/api/password", post(set_password))
         .route("/api/password/tune", post(tune_passwords))
         .route("/api/overview", get(overview))
@@ -168,7 +155,7 @@ pub fn router(state: St) -> Router {
         .route("/api/certificate", get(certificate_info))
         .route("/api/certificate/names", post(add_certificate_name))
         .route("/api/qr", get(qr))
-        .merge(crate::passkeys::auth_routes())
+        .merge(crate::auth::routes())
         .route("/api/shares", get(list_shares).post(create_share))
         .route("/api/shares/{id}", axum::routing::put(update_share).delete(delete_share))
         .route("/api/shares/{id}/regenerate", post(regenerate_share))
@@ -182,11 +169,11 @@ pub fn router(state: St) -> Router {
         .merge(static_routes())
         .route("/api/health", get(health))
         .route("/api/ping", get(ping))
-        .route("/api/login", post(login))
-        .merge(crate::passkeys::routes())
+        .nest("/auth", doorward::axum::routes())
         .merge(api)
         .merge(crate::share::routes())
         .fallback(not_found)
+        .layer(middleware::from_fn_with_state(state.clone(), crate::auth::pin))
         .with_state(state)
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
         .layer(middleware::from_fn(crate::http::harden))
@@ -269,6 +256,10 @@ pub async fn serve(
             if let Ok(Err(e)) = r {
                 tracing::warn!("renewing the certificate failed: {e:#}");
             }
+            // Sign-in follows the certificate's names and addresses.
+            if let Err(e) = renew_state.auth.refresh(&renew_state.store, &renew_state.certs).await {
+                tracing::warn!("updating sign-in addresses failed: {e:#}");
+            }
         }
     });
     let reaper_state = state.clone();
@@ -278,6 +269,12 @@ pub async fn serve(
         loop {
             iv.tick().await;
             ticks += 1;
+            if ticks % 120 == 2 {
+                // Every ten minutes: expired sessions, old log lines.
+                if let Err(e) = reaper_state.auth.latest().upkeep().await {
+                    tracing::warn!("sign-in upkeep failed: {e}");
+                }
+            }
             if ticks % 6 == 1 {
                 match blocking(&reaper_state.store, |s| s.close_inactive_shares(now_ms())).await {
                     Ok(n) if n > 0 => {
@@ -331,42 +328,52 @@ pub async fn serve(
 
 /// The visitor's address. When the connection comes from a trusted proxy
 /// (share.trusted_proxies, by default this machine, e.g. cloudflared), use
-/// the address it reports in CF-Connecting-IP / X-Forwarded-For.
+/// the address it reports.
 pub fn client_ip(st: &AppState, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
     forwarded_ip(peer, headers, &st.trusted)
 }
 
+/// IPv4 addresses written as IPv6 (`::ffff:a.b.c.d`) as plain IPv4.
+fn canonical(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+/// From a trusted proxy: the right-most `X-Forwarded-For` entry that isn't
+/// itself a trusted proxy (everything left of it could have been written by
+/// the visitor), or `CF-Connecting-IP` when there's no `X-Forwarded-For`
+/// (cloudflared sends both). From anyone else, the connection's address.
 fn forwarded_ip(peer: SocketAddr, headers: &HeaderMap, trusted: &[(IpAddr, u8)]) -> IpAddr {
-    let p = peer.ip();
-    if crate::http::in_nets(p, trusted) {
-        for name in ["cf-connecting-ip", "x-forwarded-for"] {
-            if let Some(ip) = headers
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.split(',').next())
-                .and_then(|v| v.trim().parse::<IpAddr>().ok())
-            {
-                return ip;
-            }
+    let p = canonical(peer.ip());
+    if !crate::http::in_nets(p, trusted) {
+        return p;
+    }
+    let mut entries: Vec<&str> = Vec::new();
+    for v in headers.get_all("x-forwarded-for") {
+        let Ok(v) = v.to_str() else { return p };
+        entries.extend(v.split(','));
+    }
+    for e in entries.iter().rev() {
+        match e.trim().parse::<IpAddr>() {
+            Ok(ip) if !crate::http::in_nets(canonical(ip), trusted) => return canonical(ip),
+            Ok(_) => continue,
+            Err(_) => return p,
+        }
+    }
+    if entries.is_empty() {
+        let mut cf = headers.get_all("cf-connecting-ip").iter();
+        if let (Some(v), None) = (cf.next(), cf.next())
+            && let Some(ip) = v.to_str().ok().and_then(|v| v.trim().parse::<IpAddr>().ok())
+        {
+            return canonical(ip);
         }
     }
     p
 }
 
 // ----- auth ---------------------------------------------------------------
-
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(';'))
-        .filter_map(|kv| {
-            let (k, v) = kv.trim().split_once('=')?;
-            (k == name).then(|| v.to_string())
-        })
-        .next()
-}
 
 fn constant_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -375,54 +382,34 @@ fn constant_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-async fn auth(State(st): State<St>, mut req: Request, next: Next) -> Response {
-    let headers = req.headers();
-    if let Some(bearer) = headers
+/// Who is asking: this machine (the API token in the service's data
+/// folder) or someone signed in through doorward. doorward refuses requests
+/// to addresses that aren't on its list, writes from other sites, and
+/// expired or ended sessions.
+async fn auth(State(st): State<St>, req: Request, next: Next) -> Response {
+    if let Some(bearer) = req
+        .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
     {
-        if constant_eq(bearer.trim().as_bytes(), st.token.as_bytes()) {
-            req.extensions_mut().insert(Principal { user: "local".into(), via: "token", auth_ms: now_ms() });
-            return next.run(req).await;
+        if !constant_eq(bearer.trim().as_bytes(), st.token.as_bytes()) {
+            return ApiError(StatusCode::UNAUTHORIZED, "invalid API token".into()).into_response();
         }
-        return ApiError(StatusCode::UNAUTHORIZED, "invalid API token".into()).into_response();
+        let mut req = req;
+        req.extensions_mut().insert(Principal { user: "local".into(), via: "token", session: None, recent: true });
+        return next.run(req).await;
     }
-    if let Some(tok) = cookie_value(headers, COOKIE) {
-        // Cross-site protection for cookie-authenticated writes.
-        let via_proxy = req
-            .extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .is_some_and(|c| crate::http::in_nets(c.0.ip(), &st.trusted));
-        if req.method() != Method::GET && !same_origin(headers, via_proxy) {
-            return ApiError(StatusCode::FORBIDDEN, "cross-origin request refused".into()).into_response();
+    let (mut parts, body) = req.into_parts();
+    match doorward::axum::Authenticated::from_request_parts(&mut parts, &st).await {
+        Ok(a) => {
+            let recent = crate::auth::dw(&st).is_recent(&a.session);
+            let user = a.session.user.username.clone();
+            parts.extensions.insert(Principal { user, via: "session", session: Some(a), recent });
+            next.run(Request::from_parts(parts, body)).await
         }
-        let s = st.store.clone();
-        let user = tokio::task::spawn_blocking(move || s.web_session(&tok)).await;
-        if let Ok(Ok(Some((user, auth_ms)))) = user {
-            req.extensions_mut().insert(Principal { user, via: "session", auth_ms });
-            return next.run(req).await;
-        }
+        Err(e) => e.into_response(),
     }
-    ApiError(StatusCode::UNAUTHORIZED, "login required".into()).into_response()
-}
-
-/// Does a browser request's Origin match the host it was sent to? Behind a
-/// trusted reverse proxy (`via_proxy`) the Host header may be rewritten, so
-/// the forwarded host is accepted too; from anyone else it's ignored. (The
-/// SameSite=Strict cookie is the first line of defence; this is a second.)
-fn same_origin(headers: &HeaderMap, via_proxy: bool) -> bool {
-    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
-        return true; // non-browser client or same-origin navigation
-    };
-    let Some(origin_host) = origin.strip_prefix("https://") else { return false };
-    let names: &[&str] = if via_proxy { &["host", "x-forwarded-host"] } else { &["host"] };
-    names.iter().any(|name| {
-        headers
-            .get(*name)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|h| h.split(',').next().map(str::trim) == Some(origin_host))
-    })
 }
 
 // ----- static assets ------------------------------------------------------
@@ -497,17 +484,43 @@ pub async fn favicon() -> Response {
 
 // ----- handlers -----------------------------------------------------------
 
-async fn health(State(st): State<St>, headers: HeaderMap) -> ApiResult<Json<Health>> {
-    let (has_password, passkey_required) =
-        blocking(&st.store, |s| Ok((s.has_users()?, crate::passkeys::required(s)))).await?;
+/// Whether anyone can sign in yet, and what the sign-in page should offer
+/// at the address it was asked on (public: the sign-in page needs it).
+async fn health(
+    State(st): State<St>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    method: Method,
+    headers: HeaderMap,
+) -> ApiResult<Json<Health>> {
+    let dw = crate::auth::dw(&st);
+    let here = dw
+        .visit(&doorward::RequestInfo { peer: peer.ip(), method: &method, host: None, headers: &headers })
+        .ok()
+        .map(|v| dw.address_info(&v));
+    // Elsewhere: where sign-in works (the names first; they're on the
+    // certificate every visitor is shown anyway).
+    let open_at = if here.is_some() {
+        Vec::new()
+    } else {
+        // Names before addresses, the most specific first, localhost last.
+        let mut v: Vec<&doorward::Address> = dw.addresses().iter().collect();
+        v.sort_by_key(|a| {
+            let h = a.host();
+            let ip = h.starts_with('[') || h.parse::<IpAddr>().is_ok();
+            (ip, h == "localhost", usize::MAX - h.matches('.').count(), a.origin().to_string())
+        });
+        v.into_iter().map(|a| a.origin().to_string()).take(4).collect()
+    };
     Ok(Json(Health {
         name: "pingrail".into(),
         version: env!("CARGO_PKG_VERSION").into(),
-        has_password,
+        has_password: crate::auth::has_users(&dw).await,
         listen: st.listen.clone(),
         cert_sha256: st.cert_sha256.clone(),
-        passkeys: crate::passkeys::relying_party(&st, &headers).is_ok(),
-        passkey_required,
+        passkeys: here.as_ref().is_some_and(|a| a.passkeys),
+        passkey_required: here.as_ref().is_some_and(|a| !a.passwords),
+        here: here.is_some(),
+        open_at,
     }))
 }
 
@@ -536,12 +549,9 @@ async fn ca_crt(State(st): State<St>) -> Response {
 struct CertificateView {
     #[serde(flatten)]
     info: crate::ca::CertInfo,
-    /// The address you're using, when the certificate (or its authority)
-    /// doesn't cover it yet.
+    /// The name you're using, and whether the certificate has it.
     host: Option<String>,
-    host_named: bool,
     host_covered: bool,
-    host_in_ca: bool,
     port: u16,
 }
 
@@ -565,8 +575,6 @@ async fn certificate_info(State(st): State<St>, headers: HeaderMap) -> Json<Cert
     let name = host.map(|h| h.0);
     Json(CertificateView {
         host_covered: name.as_ref().is_some_and(|n| info.names.contains(n)),
-        host_in_ca: name.as_ref().is_some_and(|n| st.certs.covers(n)),
-        host_named: name.is_some(),
         host: name,
         port,
         info,
@@ -607,9 +615,10 @@ struct NameRequest {
     name: String,
 }
 
-/// Put another name for this machine on its certificate (the web UI offers
-/// the one you browsed to). A name the authority doesn't cover means a new
-/// authority, which devices must trust again.
+/// Put another name for this machine on its certificate (from Set up a
+/// phone). Signing in then works at that name too, so it must lead to this
+/// machine and needs a recent sign-in. A name the authority doesn't cover
+/// means a new authority, which devices must trust again.
 async fn add_certificate_name(
     State(st): State<St>,
     Extension(p): Extension<Principal>,
@@ -618,18 +627,19 @@ async fn add_certificate_name(
     if st.certs.info().custom {
         return Err(ApiError::bad("this server uses a certificate configured in pingrail.toml"));
     }
-    // A new authority means every device must trust it again: only right
-    // after signing in.
-    if !st.certs.covers(req.name.trim()) && !p.recent() {
+    if !p.recent() {
         return Err(ApiError(
             StatusCode::FORBIDDEN,
-            "This makes a new certificate authority, which needs a recent sign-in. Sign out and in again, then retry".into(),
+            "Adding a name needs a recent sign-in. Sign out and in again, then retry".into(),
         ));
     }
-    // Only names that lead here: a name outside the authority's limits widens
-    // what a new authority may vouch for, so it must resolve to this machine.
     let name = req.name.trim().trim_end_matches('.').to_ascii_lowercase();
-    if crate::util::valid_dns_name(&name) && !st.certs.covers(&name) {
+    if !crate::util::valid_dns_name(&name) {
+        return Err(ApiError::bad(format!("{name} isn't a name pingrail can use")));
+    }
+    // Only names that lead here: anything else would let sign-in (and a
+    // new authority) vouch for somewhere that isn't this machine.
+    if !st.certs.dns_names().contains(&name) {
         let found = tokio::time::timeout(Duration::from_secs(4), tokio::net::lookup_host((name.as_str(), 0))).await;
         let ips: Vec<IpAddr> = match found {
             Ok(Ok(addrs)) => addrs.map(|a| a.ip()).collect(),
@@ -651,6 +661,8 @@ async fn add_certificate_name(
     .await
     .map_err(anyhow::Error::from)??
     .map_err(ApiError::bad)?;
+    // Sign-in works at the new name too.
+    st.auth.refresh(&st.store, &st.certs).await?;
     Ok(Json(changed))
 }
 
@@ -660,201 +672,39 @@ async fn ping() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-/// A refused sign-in, with when to try again (the sign-in page counts down).
-fn too_many(retry_after_secs: u64, msg: &str) -> Response {
-    let mut resp = ApiError(StatusCode::TOO_MANY_REQUESTS, msg.into()).into_response();
-    resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(retry_after_secs.max(1)));
-    resp
-}
-
-/// Before any sign-in attempt (password or passkey): refuse an address
-/// that failed too often, keep everyone together to a trickle, and slow down
-/// an address that keeps failing.
-pub async fn sign_in_gate(st: &AppState, ip: IpAddr) -> Option<Response> {
-    let (failures, last_failure) = {
-        let mut f = st.login_failures.lock().unwrap();
-        f.retain(|_, (_, at)| at.elapsed() < LOGIN_LOCKOUT);
-        f.get(&ip).map(|(n, at)| (*n, Some(*at))).unwrap_or((0, None))
-    };
-    if failures >= LOGIN_LOCKOUT_FAILURES {
-        let left = last_failure.map_or(LOGIN_LOCKOUT, |at| LOGIN_LOCKOUT.saturating_sub(at.elapsed()));
-        return Some(too_many(left.as_secs() + 1, "Too many failed sign-ins from your address. Try again in 15 minutes."));
-    }
-    if !crate::share::take(&mut st.login_budget.lock().unwrap(), (), LOGIN_BURST, LOGIN_REFILL_PER_SEC, 1.0) {
-        return Some(too_many((1.0 / LOGIN_REFILL_PER_SEC).ceil() as u64, "Too many sign-in attempts right now. Wait a moment and try again."));
-    }
-    if failures > 3 {
-        tokio::time::sleep(Duration::from_millis(500 * failures.min(10) as u64)).await;
-    }
-    None
-}
-
-/// Count a failed sign-in against `ip`.
-pub async fn sign_in_failed(st: &AppState, ip: IpAddr) {
-    {
-        let mut f = st.login_failures.lock().unwrap();
-        if f.len() >= LOGIN_TRACKED_MAX && !f.contains_key(&ip) {
-            // Forget the addresses that failed longest ago.
-            let mut by_age: Vec<(IpAddr, Instant)> = f.iter().map(|(k, (_, at))| (*k, *at)).collect();
-            by_age.sort_by_key(|(_, at)| *at);
-            for (k, _) in by_age.into_iter().take(LOGIN_TRACKED_MAX / 10) {
-                f.remove(&k);
-            }
-        }
-        let e = f.entry(ip).or_insert((0, Instant::now()));
-        e.0 += 1;
-        e.1 = Instant::now();
-    }
-    tokio::time::sleep(Duration::from_millis(400)).await;
-}
-
-/// Signed in: a new session (replacing the one this browser had, if any)
-/// and its cookie.
-pub async fn start_session(st: &AppState, ip: IpAddr, headers: &HeaderMap, username: String) -> ApiResult<Response> {
-    st.login_failures.lock().unwrap().remove(&ip);
-    let old = cookie_value(headers, COOKIE);
-    let token = random_hex(32);
-    let hours = st.cfg.web.session_hours.max(1) as i64;
-    let expires = now_ms() + hours * 3_600_000;
-    let (t, u) = (token.clone(), username.clone());
-    blocking(&st.store, move |s| {
-        if let Some(old) = old {
-            s.delete_web_session(&old)?;
-        }
-        s.create_web_session(&t, &u, expires)
-    })
-    .await?;
-    let cookie = format!("{COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={}", hours * 3600);
-    let mut resp = Json(Me { user: username, via: "session".into(), has_password: true }).into_response();
-    resp.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
-    Ok(resp)
-}
-
-/// The session cookie this request carries.
-pub fn session_cookie(headers: &HeaderMap) -> Option<String> {
-    cookie_value(headers, COOKIE)
-}
-
-async fn login(
-    State(st): State<St>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(req): Json<LoginRequest>,
-) -> ApiResult<Response> {
-    let ip = client_ip(&st, peer, &headers);
-    if blocking(&st.store, |s| Ok(crate::passkeys::required(s))).await? {
-        return Err(ApiError(StatusCode::FORBIDDEN, "This server needs a passkey to sign in".into()));
-    }
-    if let Some(refused) = sign_in_gate(&st, ip).await {
-        return Ok(refused);
-    }
-    // Only one or two password checks run at once, so a flood can't eat
-    // the machine's memory and CPU.
-    let Some(permit) = st.passwords.turn(Duration::from_secs(10)).await else {
-        return Err(busy());
-    };
-    let username = req.username.trim().to_string();
-    let u = username.clone();
-    let phc = blocking(&st.store, move |s| s.user_phc(&u)).await?;
-    let password = req.password.clone();
-    let st2 = st.clone();
-    let (u, phc2) = (username.clone(), phc.clone());
-    // Unknown usernames are checked against a stand-in, so they take as long.
-    let check = tokio::task::spawn_blocking(move || {
-        let check = st2.passwords.check(&password, phc2.as_deref());
-        // Saved with older settings: save it again with today's.
-        if check == (Check::Good { rehash: true })
-            && let Some(old) = phc2
-            && let Ok(new) = st2.passwords.hash(&password)
-            && let Err(e) = st2.store.rehash_user(&u, &old, &new)
-        {
-            tracing::warn!("saving a rehashed password failed: {e:#}");
-        }
-        check
-    })
-    .await
-    .unwrap_or(Check::Wrong);
-    // The expensive part is done: let the next check start.
-    drop(permit);
-    if check == Check::Busy {
-        return Err(busy());
-    }
-    if !matches!(check, Check::Good { .. }) {
-        sign_in_failed(&st, ip).await;
-        return Err(ApiError(StatusCode::UNAUTHORIZED, "wrong username or password".into()));
-    }
-    start_session(&st, ip, &headers, username).await
-}
-
-fn busy() -> ApiError {
-    ApiError(StatusCode::SERVICE_UNAVAILABLE, "The service is busy. Try signing in again shortly.".into())
-}
-
-async fn logout(State(st): State<St>, headers: HeaderMap) -> ApiResult<Response> {
-    if let Some(tok) = cookie_value(&headers, COOKIE) {
-        blocking(&st.store, move |s| s.delete_web_session(&tok)).await?;
-    }
-    let mut resp = StatusCode::NO_CONTENT.into_response();
-    resp.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_static("__Host-pr_session=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"),
-    );
-    Ok(resp)
-}
-
 async fn me(State(st): State<St>, Extension(p): Extension<Principal>) -> ApiResult<Json<Me>> {
-    let has_password = blocking(&st.store, |s| s.has_users()).await?;
+    let has_password = crate::auth::has_users(&crate::auth::dw(&st)).await;
     Ok(Json(Me { user: p.user, via: p.via.into(), has_password }))
 }
 
+/// `pingrail passwd` and the terminal UI's P: set a password on this
+/// machine (the API token), making the account if needed. Every session of
+/// that user ends. (Signed-in users change their own through doorward's
+/// `/auth/password`, which needs the current one.)
 async fn set_password(
     State(st): State<St>,
     Extension(p): Extension<Principal>,
     Json(req): Json<PasswordRequest>,
 ) -> ApiResult<StatusCode> {
-    if req.password.chars().count() < 8 {
-        return Err(ApiError::bad("password must be at least 8 characters"));
+    if p.via != "token" {
+        return Err(ApiError(StatusCode::FORBIDDEN, "change your password in the web UI's menu".into()));
     }
-    let username = match (&req.username, p.via) {
-        (Some(u), "token") if !u.trim().is_empty() => u.trim().to_string(),
-        (_, "token") => "admin".to_string(),
-        // A web user can only change their own password.
-        _ => p.user.clone(),
-    };
-    let Some(permit) = st.passwords.turn(Duration::from_secs(10)).await else {
-        return Err(busy());
-    };
-    let pw = req.password.clone();
-    let st2 = st.clone();
-    let phc = tokio::task::spawn_blocking(move || st2.passwords.hash(&pw)).await.map_err(anyhow::Error::from)?;
-    drop(permit);
-    let phc = match phc {
-        Ok(phc) => phc,
-        Err(HashError::Busy) => return Err(busy()),
-        Err(e) => return Err(anyhow::Error::from(e).into()),
-    };
-    blocking(&st.store, move |s| s.set_user(&username, &phc)).await?;
+    let username = req.username.as_deref().map(str::trim).filter(|u| !u.is_empty()).unwrap_or("admin");
+    crate::auth::set_password(&crate::auth::dw(&st), username, &req.password)
+        .await
+        .map_err(crate::auth::api_error)?;
+    tracing::info!("password set for {username}");
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// Re-time password hashing for this machine (`pingrail passwd --tune`).
 /// Only the API token may ask: it takes a second or two of full CPU.
-async fn tune_passwords(State(st): State<St>, Extension(p): Extension<Principal>) -> ApiResult<Json<crate::password::Policy>> {
+async fn tune_passwords(State(st): State<St>, Extension(p): Extension<Principal>) -> ApiResult<Json<serde_json::Value>> {
     if p.via != "token" {
         return Err(ApiError(StatusCode::FORBIDDEN, "run `pingrail passwd --tune` on the server".into()));
     }
-    let Some(_permit) = st.passwords.turn(Duration::from_secs(10)).await else {
-        return Err(busy());
-    };
-    let st2 = st.clone();
-    let policy = tokio::task::spawn_blocking(move || -> Result<crate::password::Policy> {
-        let policy = crate::password::load_or_tune(&st2.store, true)?;
-        st2.passwords.replace(policy)?;
-        Ok(policy)
-    })
-    .await
-    .map_err(anyhow::Error::from)??;
-    Ok(Json(policy))
+    let policy = crate::auth::dw(&st).retune_hashing().await.map_err(crate::auth::api_error)?;
+    Ok(Json(serde_json::json!({ "describe": policy.describe() })))
 }
 
 #[derive(Deserialize)]
@@ -1258,6 +1108,16 @@ mod tests {
         assert_eq!(forwarded_ip(lan, &m, &trusted).to_string(), "192.168.1.50", "an untrusted LAN host can't fake its address");
         let outside: SocketAddr = "8.8.8.8:5000".parse().unwrap();
         assert_eq!(forwarded_ip(outside, &m, &trusted).to_string(), "8.8.8.8", "headers from the internet are ignored");
+        // X-Forwarded-For: the right-most entry the proxy added, not what the
+        // visitor wrote in front of it.
+        let spoofed = h(&[("x-forwarded-for", "10.0.0.1, 41.13.2.9"), ("cf-connecting-ip", "10.0.0.2")]);
+        assert_eq!(forwarded_ip(peer, &spoofed, &trusted).to_string(), "41.13.2.9");
+        let chained = h(&[("x-forwarded-for", "41.13.2.9, 127.0.0.1")]);
+        assert_eq!(forwarded_ip(peer, &chained, &trusted).to_string(), "41.13.2.9", "our own proxies are skipped");
+        let junk = h(&[("x-forwarded-for", "41.13.2.9, nonsense")]);
+        assert_eq!(forwarded_ip(peer, &junk, &trusted).to_string(), "127.0.0.1", "unreadable: the proxy itself");
+        let mapped = h(&[("x-forwarded-for", "::ffff:41.13.2.9")]);
+        assert_eq!(forwarded_ip(peer, &mapped, &trusted).to_string(), "41.13.2.9");
     }
 
     fn h(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
@@ -1269,21 +1129,6 @@ mod tests {
     }
 
     #[test]
-    fn origin_checks() {
-        assert!(same_origin(&h(&[("host", "pi:8040")]), false));
-        assert!(same_origin(&h(&[("host", "pi:8040"), ("origin", "https://pi:8040")]), false));
-        assert!(!same_origin(&h(&[("host", "pi:8040"), ("origin", "http://pi:8040")]), false), "https only");
-        assert!(!same_origin(&h(&[("host", "pi:8040"), ("origin", "https://evil.example")]), false));
-        let proxied = h(&[
-            ("host", "127.0.0.1:8040"),
-            ("x-forwarded-host", "pingrail.example.com"),
-            ("origin", "https://pingrail.example.com"),
-        ]);
-        assert!(same_origin(&proxied, true));
-        assert!(!same_origin(&proxied, false), "forwarded host only counts from a trusted proxy");
-    }
-
-    #[test]
     fn forwarded_host_only_from_trusted_proxies() {
         let m = h(&[("host", "pi.lan:8040"), ("x-forwarded-host", "evil.example")]);
         assert_eq!(host_of(&m, false), "pi.lan:8040");
@@ -1292,9 +1137,7 @@ mod tests {
     }
 
     #[test]
-    fn cookies_and_tokens() {
-        let m = h(&[("cookie", "a=1; __Host-pr_session=abc; b=2")]);
-        assert_eq!(cookie_value(&m, COOKIE).as_deref(), Some("abc"));
+    fn tokens() {
         assert!(constant_eq(b"same", b"same"));
         assert!(!constant_eq(b"same", b"diff"));
         assert!(!constant_eq(b"short", b"longer"));

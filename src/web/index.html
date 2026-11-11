@@ -226,9 +226,10 @@
             <div class="chart-wrap">
               <canvas id="chart" class="chart" role="img" aria-label="Latency over time"></canvas>
               <canvas id="loss" class="loss" role="img" aria-label="Packet loss over time"></canvas>
+              <div id="marks" class="marks"></div>
               <div id="tooltip" class="tooltip" hidden></div>
             </div>
-            <p id="legend" class="legend muted"><span class="key-line"></span> <span id="legend-avg">average</span> <span id="legend-spread-key" class="key-band"></span> <span id="legend-spread">lowest to highest</span> <span class="key-loss"></span> <span id="legend-loss">packet loss</span> <span class="key-gap"></span> no samples</p>
+            <p id="legend" class="legend muted"><span class="key-line"></span> <span id="legend-avg">average</span> <span id="legend-spread-key" class="key-band"></span> <span id="legend-spread">lowest to highest</span> <span class="key-loss"></span> <span id="legend-loss">packet loss</span> <span class="key-gap"></span> no samples <span id="legend-mark" hidden><span class="key-mark"></span> address changed</span></p>
             <p id="chart-caption" class="hint"></p>
           </div>
 
@@ -336,6 +337,7 @@
 <dialog id="password-dialog">
   <form id="password-form" method="dialog">
     <h2>Change password</h2>
+    <label>Current password <input name="p0" type="password" required autocomplete="current-password"></label>
     <label>New password <input name="p1" type="password" minlength="8" required autocomplete="new-password"></label>
     <label>Repeat it <input name="p2" type="password" minlength="8" required autocomplete="new-password"></label>
     <p class="hint">Changing the password signs you out on other devices.</p>
@@ -386,6 +388,14 @@
     <p class="hint" id="phone-intro">Point the phone’s camera at each code in turn.</p>
     <div class="warn-note" id="phone-note" hidden></div>
     <label id="phone-host-row" hidden>Open pingrail as <select id="phone-host"></select></label>
+    <details class="howto" id="phone-name">
+      <summary class="trail">Use another name for this machine</summary>
+      <form class="row add-row" id="phone-name-form">
+        <label class="grow">Name <input name="name" maxlength="253" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="pingrail.home.arpa" required></label>
+        <button type="submit" class="primary">Add</button>
+      </form>
+      <p class="hint">It has to lead to this machine on your network. It goes on pingrail’s certificate, and signing in works there too.</p>
+    </details>
     <ol class="stations">
       <li class="station" id="station-trust">
         <h3 class="station__title"><span class="station__no" aria-hidden="true">1</span>Trust this server</h3>

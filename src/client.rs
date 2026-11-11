@@ -14,6 +14,11 @@ use crate::model::*;
 #[error("{0}")]
 pub struct Unauthorized(pub String);
 
+/// Returned (inside anyhow) when the server answered and said no.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct Refused(pub String);
+
 #[derive(Clone, Debug)]
 enum Auth {
     None,
@@ -109,7 +114,7 @@ impl Client {
         if status == StatusCode::UNAUTHORIZED {
             return Err(Unauthorized(msg).into());
         }
-        Err(anyhow!(msg))
+        Err(Refused(msg).into())
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -130,22 +135,41 @@ impl Client {
         self.get_json("/api/me").await
     }
 
+    /// Sign in with the web UI's username and password (doorward).
     pub async fn login(&self, username: &str, password: &str) -> Result<()> {
         let r = self
             .http
-            .post(format!("{}/api/login", self.base))
+            .post(format!("{}/auth/sign-in", self.base))
             .json(&LoginRequest { username: username.into(), password: password.into() })
             .send()
             .await
             .map_err(|e| self.conn_err(e))?;
-        let r = Self::check(r).await?;
+        let status = r.status();
+        if !status.is_success() {
+            let code = r.json::<serde_json::Value>().await.ok().and_then(|v| v["error"].as_str().map(String::from));
+            let msg = match (status.as_u16(), code.as_deref()) {
+                (401, _) => "wrong username or password",
+                (429, _) => "too many sign-in attempts; wait a moment and try again",
+                (_, Some("passwords_disabled_here")) => "this server needs a passkey to sign in (use the web UI)",
+                (_, Some("address_not_allowed")) => "this server doesn't take sign-ins at that address; connect by a name or address on its certificate",
+                (503, _) => "the service is busy; try again in a moment",
+                _ => "signing in failed",
+            };
+            return Err(if status == StatusCode::UNAUTHORIZED { Unauthorized(msg.into()).into() } else { Refused(msg.into()).into() });
+        }
+        // The session and remembered-browser cookies, as the Cookie header.
         let cookie = r
             .headers()
-            .get(SET_COOKIE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(';').next())
-            .map(String::from)
-            .ok_or_else(|| anyhow!("server did not start a session"))?;
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .filter_map(|v| v.split(';').next())
+            .filter(|kv| kv.split_once('=').is_some_and(|(_, v)| !v.is_empty()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if cookie.is_empty() {
+            bail!("server did not start a session");
+        }
         *self.auth.write().unwrap() = Auth::Cookie(cookie);
         Ok(())
     }
@@ -165,10 +189,10 @@ impl Client {
         self.get_json("/api/passkeys").await
     }
 
-    pub async fn remove_passkey(&self, id: i64) -> Result<()> {
+    pub async fn remove_passkey(&self, id: &str) -> Result<crate::auth::PasskeyView> {
+        let id: String = id.chars().filter(|c| c.is_ascii_hexdigit() || *c == '-').collect();
         let r = self.req(reqwest::Method::DELETE, &format!("/api/passkeys/{id}")).send().await.map_err(|e| self.conn_err(e))?;
-        Self::check(r).await?;
-        Ok(())
+        Ok(Self::check(r).await?.json().await?)
     }
 
     pub async fn reset_passkeys(&self) -> Result<()> {
@@ -177,9 +201,11 @@ impl Client {
         Ok(())
     }
 
-    pub async fn tune_passwords(&self) -> Result<crate::password::Policy> {
+    /// Re-time password hashing; answers what it chose, in words.
+    pub async fn tune_passwords(&self) -> Result<String> {
         let r = self.req(reqwest::Method::POST, "/api/password/tune").send().await.map_err(|e| self.conn_err(e))?;
-        Ok(Self::check(r).await?.json().await?)
+        let v: serde_json::Value = Self::check(r).await?.json().await?;
+        Ok(v["describe"].as_str().unwrap_or("re-timed").to_string())
     }
 
     pub async fn overview(&self, window_ms: i64, spark: usize) -> Result<Overview> {

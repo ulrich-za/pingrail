@@ -25,7 +25,7 @@ Download the installer or package for your system from the [latest release](http
 
 ### Windows 10/11 and Windows Server
 
-Run `pingrail-0.3.1-x64.msi`. It:
+Run `pingrail-0.3.2-x64.msi`. It:
 
 - installs `pingrail.exe` to `C:\Program Files\pingrail` and adds that folder to `PATH`;
 - adds a **pingrail** Start menu shortcut (opens the TUI);
@@ -53,7 +53,7 @@ else needs installing either: the OpenSSL that passkeys use is compiled into
 ### Debian, Ubuntu, Raspberry Pi OS
 
 ```sh
-sudo apt install ./pingrail_0.3.1-1_amd64.deb     # or _arm64.deb on a Raspberry Pi 4/5
+sudo apt install ./pingrail_0.3.2-1_amd64.deb     # or _arm64.deb on a Raspberry Pi 4/5
 ```
 
 The package:
@@ -86,6 +86,24 @@ Reports look for the DejaVu fonts in `assets/fonts` during development; installe
 copies find them beside the program (`fonts\` on Windows), in
 `/usr/share/pingrail/fonts`, in the distribution's `fonts-dejavu-core` package, or
 in `PINGRAIL_FONT_DIR`, and fall back to the system's fonts.
+
+### Upgrading from 0.3
+
+0.3.2 hands signing in to [doorward](https://github.com/ulrich-za/doorward),
+pingrail's sign-in library. On first start it moves the web UI's account and
+passkeys across: the password and passkeys keep working, but everyone signs in
+once more. Other changes you'll notice:
+
+- Signing in works at the names and addresses on pingrail's certificate. At
+  any other name the sign-in page points to one that works. To use another
+  name, add it from menu › **Set up a phone** › *Use another name for this
+  machine*.
+- Changing the password in the web UI asks for the current one, and keeps you
+  signed in on the device you change it from.
+- New passwords can't be one of the 5,000 most common, or contain the username
+  or "pingrail".
+- Someone guessing passwords can no longer slow down your own sign-in: limits
+  are per visitor, and a browser that has signed in before has its own.
 
 ### Upgrading from 0.2
 
@@ -221,10 +239,13 @@ to a device that trusts it.
 
 The TUI and CLI on the same machine trust the service automatically; other
 machines trust it with `pingrail trust <url>` after you compare fingerprints.
-If you open pingrail by a name the certificate doesn't cover yet, the web UI
-offers to add it. A name outside the authority's limits means a new authority,
-which devices must trust again (pingrail says so). Delete `ca.pem` and
-`ca-key.pem` and restart the service to start over.
+
+Signing in works at the names and addresses on the certificate (at any other
+name the sign-in page points to one that works). To use another name for this
+machine, add it from menu › **Set up a phone** › *Use another name for this
+machine*; it has to lead to this machine. A name outside the authority's
+limits means a new authority, which devices must trust again (pingrail says
+so). Delete `ca.pem` and `ca-key.pem` and restart the service to start over.
 
 To use your own certificate (from your CA, Let's Encrypt, or a Cloudflare Origin
 CA certificate), point pingrail at the PEM files and restart the service:
@@ -254,9 +275,10 @@ certificate they trust, so open pingrail as `https://mypc.lan:8040` or
 similar on a device that trusts pingrail's [certificate authority](#https). A
 passkey belongs to the name it was made on.
 
-**Require a passkey to sign in** turns password sign-in off. If you lose every
-passkey, run `pingrail passkeys reset` on the machine running the service: it
-removes them all and lets the password sign in again.
+**Require a passkey to sign in** turns password sign-in off (and with it,
+signing in by IP address). If you lose every passkey, run
+`pingrail passkeys reset` on the machine running the service: it removes them
+all and lets the password sign in again.
 
 Adding or removing a passkey, or requiring them, signs you out everywhere else.
 
@@ -286,6 +308,15 @@ so a link you send lands on a trustworthy picture:
   samples. The bold line is the average; the band runs from lowest to highest.*
 - The **route graph** shows each hop's average joined hop to hop, with its
   min–max range, like PingPlotter's.
+- A **▲ mark** on the time axis, with a dotted line through the graphs, shows
+  when the target's name started resolving to another address. A CDN or
+  load balancer handing out a different server is a common reason for a sudden
+  step in latency. Point at the mark (or tab to it) to see the old and new
+  addresses and the average latency before and after. pingrail looks the name
+  up again every five minutes and when a target starts, and sticks with the
+  address it has while the name still offers it, so names with several
+  addresses don't flap. Reports list the changes under the graph; the TUI
+  marks them on the time axis too.
 
 The web UI, share links, TUI and reports all use the same rules.
 
@@ -455,7 +486,7 @@ pingrail export [--last 1h | --from T --to T] [-t TARGET]... [-f pdf|png] [-o FI
 pingrail passwd [--user admin] [--generate]
 pingrail passwd --tune                       re-time password hashing for this machine
 pingrail passkeys list                       everyone's passkeys, and whether they're required
-pingrail passkeys remove <id>
+pingrail passkeys remove <id>                 the first few characters of its id do
 pingrail passkeys reset                      remove every passkey; the password signs in again
 pingrail service install|uninstall [--purge]|start|stop|status
 pingrail service run [--listen ADDR]          what the service manager runs
@@ -488,7 +519,7 @@ key_file = ""
 [share]
 listen = "0.0.0.0:8041"     # share-link-only port; "" = serve links on the web UI port
 public_url = ""             # e.g. "https://pingrail.example.com" behind a tunnel
-trusted_proxies = ["127.0.0.1", "::1"]   # may set X-Forwarded-For / CF-Connecting-IP
+trusted_proxies = ["127.0.0.1", "::1"]   # may say who they forward for (e.g. cloudflared)
 
 [probe]
 interval_ms = 2500          # default for new targets
@@ -538,35 +569,43 @@ loss_crit_pct = 10.0
   `http://` requests get a redirect and the connection is closed.
 - The service's API accepts either the **API token** in its data directory
   (used by the TUI/CLI on the same machine) or a **web session** from signing in.
+  Signing in, sessions and passkeys are handled by
+  [doorward](https://github.com/ulrich-za/doorward), which keeps its own tables
+  (`auth_…`) in pingrail's database.
   On Linux the token is readable only by the `pingrail` user and the installing
   user; on Windows by local users (the default ProgramData permissions). The
   private keys of the certificate and its authority are readable only by the
   service (and, on Windows, SYSTEM and Administrators). If they can't be read,
   pingrail stops rather than quietly making a new authority.
 - Web passwords are stored as **Argon2id** hashes sized to the machine: on first
-  start pingrail gives each check 2 % of the memory (or 10 % of what's free,
-  whichever is less, between 19 and 256 MiB) and times the passes so a check
-  takes about a third of a second, never below OWASP's minimum. One or two
-  checks run at once, depending on memory. Saved passwords move to new settings
-  the next time they sign in; `pingrail passwd --tune` re-times after a hardware
-  change (it happens by itself when the memory changes by more than a fifth).
-  Unknown usernames take as long to check as real ones.
-- Sign-in (password or passkey) is rate-limited for everyone together,
-  repeated failures from one address are slowed and, after 20 in 15 minutes,
-  refused for 15 minutes (the refusal carries `Retry-After`, which the sign-in
-  page counts down). Changing the password signs out every session.
+  start each check gets 2 % of the memory (or 10 % of what's free, whichever is
+  less, between 19 and 256 MiB) and the passes are timed so a check takes about
+  a third of a second, never below OWASP's minimum. One or two checks run at
+  once, depending on memory. Saved passwords move to new settings the next time
+  they sign in; `pingrail passwd --tune` re-times after a hardware change (it
+  happens by itself when the memory changes by more than a fifth). Unknown
+  usernames take as long to check as real ones, and new passwords can't be one
+  of the 5,000 most common.
+- **Nobody can lock you out by guessing.** Sign-in attempts are limited per
+  visitor (an IPv4 address or IPv6 /64), accounts are never locked, and a
+  browser that has signed in before has its own allowance and skips the queue
+  for password checks. A refusal carries `Retry-After`, which the sign-in page
+  counts down. Sign-ins, failures and changes go to a security log (the
+  `doorward::security` lines in the service log). Changing the password ends
+  every other session.
+- **Signing in works only at the names and addresses on the certificate**, on
+  the web UI port; requests for any other name are refused, and the share
+  port has none of it. A session works only at the address it was made on.
 - **Passkeys** are WebAuthn credentials checked with webauthn-rs, which require
-  user verification (a PIN, fingerprint or face). They work only on the web UI
-  port, on a name on the certificate; the share port has none of their
-  addresses. Adding or removing passkeys, requiring them or making a new
-  certificate authority needs a sign-in from the last ten minutes, and signs
-  out every other session.
-- Session cookies are stored as their SHA-256, so a copy of the database can't
-  be used to sign in.
-- The session cookie is `__Host-`, `Secure`, `HttpOnly` and `SameSite=Strict`.
-  Changes made in the web UI are also refused if the request's `Origin` doesn't
-  match its `Host`. `X-Forwarded-Host` counts only from `share.trusted_proxies`,
-  so behind a reverse proxy on another machine, list it there.
+  user verification (a PIN, fingerprint or face). Adding or removing passkeys,
+  requiring them or making a new certificate authority needs a sign-in (or a
+  confirmation) from the last ten minutes; adding, removing or requiring them
+  signs out every other session.
+- Sessions are stored as the SHA-256 of their cookie, so a copy of the database
+  can't be used to sign in. The session cookie is `__Host-`, `Secure`,
+  `HttpOnly` and `SameSite=Strict`, and is replaced at every sign-in and
+  confirmation. Changes made in the web UI are also refused unless the
+  request's `Origin` matches the address exactly (scheme, name and port).
 - Keep the admin UI (8040) on your LAN or VPN. For remote access, put Tailscale,
   WireGuard or Cloudflare Access in front of it rather than port-forwarding.
 - Share-link codes are 160-bit random values. A link only ever reveals the
@@ -612,9 +651,11 @@ nothing away and to shrug off abuse:
   as the link says now, not as it said when they were added. Visitors can't
   probe faster than the link allows and can't fill your disk (per-link
   retention and storage limits plus the low-disk guard).
-- **Real addresses only from proxies you trust.** `X-Forwarded-For`,
-  `CF-Connecting-IP` and `X-Forwarded-Host` are honoured only from
-  `share.trusted_proxies`.
+- **Real addresses only from proxies you trust.** From `share.trusted_proxies`
+  only, pingrail takes the right-most `X-Forwarded-For` address the proxy added
+  (anything to its left could have been written by the visitor), or
+  `CF-Connecting-IP` when there's no `X-Forwarded-For`. `X-Forwarded-Host`
+  counts only from those proxies too.
 - The Windows service runs as LocalService and the Linux service as its own user
   with only `CAP_NET_RAW`, so a flaw can't reach much else.
 

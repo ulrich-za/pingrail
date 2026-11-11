@@ -75,6 +75,7 @@ def main():
     pkgs.sort(key=lambda p: (p["name"], p["version"]))
     groups = {}  # licence text -> list of (name, version, licence)
     index = []
+    notices = []  # (component, its NOTICE text)
     for p in pkgs:
         d = os.path.dirname(p["manifest_path"])
         expr = p.get("license") or "see crate"
@@ -88,6 +89,13 @@ def main():
             groups.setdefault(text, []).append(f"{p['name']} {p['version']}")
         index.append(f"  {p['name']} {p['version']}  —  {expr}  (used under {' AND '.join(choose(expr))})"
                      + (f"\n      {p['repository']}" if p.get("repository") else ""))
+        # Apache-2.0 asks for a component's NOTICE file to be passed on (doorward's,
+        # for one, credits the common-password list built into it).
+        for f in ("NOTICE", "NOTICE.txt", "NOTICE.md"):
+            n = os.path.join(d, f)
+            if os.path.isfile(n):
+                notices.append((f"{p['name']} {p['version']}", open(n, encoding="utf-8", errors="replace").read().strip()))
+                break
 
     # OpenSSL itself, built from the source openssl-src carries.
     # (openssl-src is a build dependency, so it isn't in the linked list.)
@@ -128,6 +136,8 @@ def main():
         w("-" * 72 + "\n")
         w("Applies to: " + ", ".join(sorted(set(users))) + "\n\n")
         w(text + "\n\n")
+    for who, text in notices:
+        w("-" * 72 + f"\nNOTICE of {who}\n\n" + text + "\n\n")
     # Rust std
     w("-" * 72 + "\nApplies to: the Rust standard library\n\n"
       "Copyright (c) The Rust Project Contributors\n\n" + GENERIC_MIT + "\n")

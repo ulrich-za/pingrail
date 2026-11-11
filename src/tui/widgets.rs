@@ -25,6 +25,8 @@ pub fn level_color(l: Level) -> Color {
 pub struct TimelineChart<'a> {
     pub timeline: &'a Timeline,
     pub th: Thresholds,
+    /// Changes to mark on the time axis (such as a new address).
+    pub events: &'a [crate::model::TargetEvent],
 }
 
 fn fmt_axis(v: f64) -> String {
@@ -165,6 +167,14 @@ impl Widget for TimelineChart<'_> {
             put_str(buf, lx, y, &label, axis_style, area.x + area.width);
             last_end = lx + w;
         }
+        // Changes: a mark on the time axis, over the labels.
+        for e in self.events {
+            if e.ts_ms < self.timeline.from_ms || e.ts_ms > self.timeline.to_ms {
+                continue;
+            }
+            let col = ((e.ts_ms - self.timeline.from_ms) as i128 * plot.width as i128 / span as i128) as u16;
+            put(buf, plot.x + col.min(plot.width.saturating_sub(1)), y, "▲", Style::new().fg(Color::Magenta).bold());
+        }
     }
 }
 
@@ -298,4 +308,29 @@ pub fn range_gauge(min: Option<f64>, avg: Option<f64>, max: Option<f64>, scale: 
         spans.push(Span::styled("›", Style::new().fg(Color::DarkGray)));
     }
     Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Point, TargetEvent};
+
+    #[test]
+    fn timeline_marks_changes_on_the_time_axis() {
+        let points = (0..60)
+            .map(|i| Point { t_ms: i * 1000, sent: 1, lost: 0, min_ms: Some(5.0), avg_ms: Some(5.0), max_ms: Some(5.0), gap: false })
+            .collect();
+        let tl = Timeline { from_ms: 0, to_ms: 60_000, step_ms: 1000, interval_ms: 1000, points, ..Default::default() };
+        let events = [
+            TargetEvent { ts_ms: 30_000, kind: "address".into(), ..Default::default() },
+            TargetEvent { ts_ms: 90_000, kind: "address".into(), ..Default::default() },
+        ];
+        let area = Rect::new(0, 0, 47, 6);
+        let mut buf = Buffer::empty(area);
+        TimelineChart { timeline: &tl, th: Thresholds::default(), events: &events }.render(area, &mut buf);
+        let bottom: String = (0..area.width).map(|x| buf[(x, area.height - 1)].symbol().to_string()).collect();
+        assert_eq!(bottom.matches('▲').count(), 1, "one mark, the other is out of view: {bottom}");
+        // Halfway along the plot (which starts after the 6-column labels and the axis).
+        assert_eq!(bottom.chars().position(|c| c == '▲'), Some(7 + 40 / 2));
+    }
 }

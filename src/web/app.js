@@ -45,8 +45,37 @@ const HAS_EXPORT = !!$('#export-dialog');
 /*@end*/
 
 class ApiError extends Error {
-  constructor(msg, status) { super(msg); this.status = status; }
+  constructor(msg, status, code) { super(msg); this.status = status; this.code = code; }
 }
+
+/*@admin*/
+/** doorward's answers (from /auth/…) in words. */
+const AUTH_WORDS = {
+  busy: 'The service is busy. Try again in a moment.',
+  password_too_short: 'Use at least 8 characters.',
+  password_too_long: 'Use at most 256 characters.',
+  password_too_common: 'That password is too easy to guess: it’s a common one, or contains the username or “pingrail”. Choose another.',
+  invalid_credentials: 'That password isn’t right.',
+  passkey_not_recognised: 'That passkey isn’t one this server knows. Try another, or the password.',
+  too_many_attempts: 'Too many attempts. Wait a moment and try again.',
+  not_signed_in: 'Please sign in again.',
+  needs_recent_sign_in: 'Confirm it’s you first.',
+  cross_origin: 'Refused: the request came from another site.',
+  address_not_allowed: 'pingrail doesn’t take sign-ins at this address.',
+  passwords_disabled_here: 'This server needs a passkey to sign in.',
+  passkeys_unavailable_here: 'Passkeys don’t work at this address. Open pingrail by its name.',
+  ceremony_expired: 'The passkey request expired. Try again.',
+  last_passkey: 'This is the last passkey that works there. Turn off “Require a passkey” before removing it.',
+  too_many_passkeys: 'At most 20 passkeys. Remove one first.',
+  passkey_already_added: 'That passkey is already added.',
+  passkey_rejected: 'The passkey couldn’t be used.',
+  account_disabled: 'This account is switched off.',
+  not_found: 'It’s gone already.',
+  forbidden: 'Not allowed.',
+  internal: 'Something went wrong. The service log has the details.',
+};
+const authWords = (code) => AUTH_WORDS[code] || code;
+/*@end*/
 
 async function api(path, opts = {}) {
   const init = { credentials: 'same-origin', headers: {}, method: opts.method || 'GET' };
@@ -70,11 +99,15 @@ async function api(path, opts = {}) {
   if (!r.ok) {
     let msg = r.statusText;
     try { msg = (await r.json()).error || msg; } catch (_) { /* not JSON */ }
+    const code = msg;
+    /*@admin*/
+    msg = authWords(msg);
+    /*@end*/
     /*@share*/
     // The link was switched off or expired while someone was looking at it.
     if (r.status === 410) showClosed(msg);
     /*@end*/
-    throw new ApiError(msg, r.status);
+    throw new ApiError(msg, r.status, code);
   }
   if (r.status === 204) return null;
   return (r.headers.get('content-type') || '').includes('json') ? r.json() : r;
@@ -314,6 +347,27 @@ function selectedOverview() {
 }
 
 /*@admin*/
+/** A POST to doorward's sign-in endpoints. A 401 there is usually an
+ *  answer (a wrong password, an unknown passkey), not an expired session. */
+async function authCall(path, json) {
+  let r;
+  try {
+    r = await fetch(path, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(json) });
+  } catch (_) {
+    throw new ApiError('Cannot reach the pingrail service.', 0);
+  }
+  let body = null;
+  try { body = await r.json(); } catch (_) { /* not JSON */ }
+  if (!r.ok) {
+    const code = (body && body.error) || '';
+    if (code === 'not_signed_in' && S.inApp) Login.show('expired');
+    const e = new ApiError(authWords(code) || r.statusText, r.status, code);
+    e.retryAfter = Number(r.headers.get('Retry-After')) || (body && body.retry_after) || 60;
+    throw e;
+  }
+  return body;
+}
+
 // ---------------------------------------------------------------------------
 // passkeys: the browser's WebAuthn calls, with the server's JSON
 
@@ -332,24 +386,6 @@ const Passkey = (() => {
     return v;
   };
   const supported = () => typeof window.PublicKeyCredential === 'function' && !!navigator.credentials;
-  // Signing in talks to the server directly: a refused passkey (401) is an
-  // answer here, not an expired session.
-  async function post(path, json) {
-    let r;
-    try {
-      r = await fetch(path, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(json) });
-    } catch (_) {
-      throw new ApiError('Cannot reach the pingrail service.', 0);
-    }
-    let body = null;
-    try { body = await r.json(); } catch (_) { /* not JSON */ }
-    if (!r.ok) {
-      const e = new ApiError((body && body.error) || r.statusText, r.status);
-      e.retryAfter = Number(r.headers.get('Retry-After')) || 60;
-      throw e;
-    }
-    return body;
-  }
 
   /** Why a passkey request failed, in words; null when the person cancelled. */
   function explain(e) {
@@ -368,10 +404,9 @@ const Passkey = (() => {
     }
   }
 
-  /** Sign in (or confirm it's you): 'conditional' fills the username box's
-   *  suggestions, 'modal' asks straight away. Resolves to the /api/me reply. */
-  async function signIn(mediation, signal) {
-    const start = await post('/api/passkey/sign-in', {});
+  /** Ask the browser for a passkey answering `start`'s challenge, and send
+   *  the answer to `finish`. */
+  async function assert(start, finish, mediation, signal) {
     const pk = clean(start.options.publicKey);
     pk.challenge = dec(pk.challenge);
     (pk.allowCredentials || []).forEach((c) => { c.id = dec(c.id); });
@@ -379,7 +414,7 @@ const Passkey = (() => {
     if (mediation === 'conditional') opts.mediation = 'conditional';
     const cred = await navigator.credentials.get(opts);
     const r = cred.response;
-    return post('/api/passkey/sign-in/finish', {
+    return authCall(finish, {
       ceremony: start.ceremony,
       credential: {
         id: cred.id,
@@ -396,16 +431,29 @@ const Passkey = (() => {
     });
   }
 
-  /** Make a passkey for the signed-in user. Resolves to the new list. */
+  /** Sign in: 'conditional' fills the username box's suggestions, 'modal'
+   *  asks straight away. */
+  async function signIn(mediation, signal) {
+    const start = await authCall('/auth/passkey/sign-in/start', {});
+    return assert(start, '/auth/passkey/sign-in/finish', mediation, signal);
+  }
+
+  /** Confirm it's you (signed in already) with a passkey. */
+  async function confirm() {
+    const start = await authCall('/auth/passkey/confirm/start', {});
+    return assert(start, '/auth/passkey/confirm/finish', 'modal');
+  }
+
+  /** Make a passkey for the signed-in user. */
   async function register(label) {
-    const start = await api('/api/passkeys/register', { json: { label } });
+    const start = await api('/auth/passkeys/register/start', { json: { label } });
     const pk = clean(start.options.publicKey);
     pk.challenge = dec(pk.challenge);
     pk.user.id = dec(pk.user.id);
     (pk.excludeCredentials || []).forEach((c) => { c.id = dec(c.id); });
     const cred = await navigator.credentials.create({ publicKey: pk });
     const r = cred.response;
-    return api('/api/passkeys/register/finish', {
+    return api('/auth/passkeys/register/finish', {
       json: {
         ceremony: start.ceremony,
         credential: {
@@ -423,7 +471,7 @@ const Passkey = (() => {
     });
   }
 
-  return { supported, explain, signIn, register };
+  return { supported, explain, signIn, confirm, register };
 })();
 
 // ---------------------------------------------------------------------------
@@ -483,7 +531,7 @@ const Login = (() => {
     async signIn(username, password) {
       let r;
       try {
-        r = await fetch('/api/login', {
+        r = await fetch('/auth/sign-in', {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
@@ -496,7 +544,7 @@ const Login = (() => {
       if (r.status === 401) return { kind: 'wrong' };
       if (r.status === 429) return { kind: 'blocked', retryAfter: parseRetry(r.headers.get('Retry-After')) };
       let message = '';
-      try { message = (await r.json()).error || ''; } catch (_) { /* not JSON */ }
+      try { message = authWords((await r.json()).error || ''); } catch (_) { /* not JSON */ }
       return { kind: 'error', message };
     },
   };
@@ -758,12 +806,24 @@ const Login = (() => {
   // Passkeys usable at this address; needed instead of the password.
   let passkeys = false;
   let passkeyOnly = false;
+  // Sign-in works only at the names and addresses on pingrail's
+  // certificate: elsewhere, where to go instead.
+  let elsewhere = null;
   function showNotice(reason) {
+    if (elsewhere) { showElsewhere(); return; }
     const text = noPassword && !passkeyOnly
       ? 'No password has been set for this monitor yet. Set one on the machine running the service: press P in pingrail’s terminal UI, or run pingrail passwd.'
       : NOTICES[reason];
     L.notice.hidden = !text;
     L.notice.textContent = text || '';
+  }
+  /** Signing in doesn't work at this name: say where it does. */
+  function showElsewhere() {
+    const links = elsewhere.map((o) => el('a', { href: `${o}/`, text: o.replace(/^https:\/\//, '') }));
+    const list = links.flatMap((a, i) => (i ? [i === links.length - 1 ? ' or ' : ', ', a] : [a]));
+    L.notice.hidden = false;
+    L.notice.replaceChildren(`pingrail doesn’t take sign-ins at ${location.hostname}. `,
+      ...(list.length ? ['Open it at ', ...list, '. To use this name too, add it there: menu › Set up a phone.'] : []));
   }
   async function checkPassword(reason) {
     try {
@@ -771,8 +831,17 @@ const Login = (() => {
       noPassword = !h.has_password;
       passkeys = !!h.passkeys && Passkey.supported();
       passkeyOnly = !!h.passkey_required;
+      elsewhere = h.here === false ? (h.open_at || []) : null;
     } catch (_) { /* the probe shows that the server isn't answering */ }
     if (!visible()) return;
+    L.form.hidden = !!elsewhere;
+    if (elsewhere) {
+      L.pw.forEach((n) => { n.hidden = true; });
+      L.lost.hidden = true;
+      L.alt.hidden = true;
+      showElsewhere();
+      return;
+    }
     showNotice(reason);
     // With passkeys required the form is one button; otherwise a passkey is
     // the alternative under it (and in the username box's suggestions).
@@ -1109,7 +1178,7 @@ const Login = (() => {
 
 async function logout() {
   closeMenu();
-  try { await api('/api/logout', { method: 'POST', json: {} }); } catch (_) { /* signed out here anyway */ }
+  try { await authCall('/auth/sign-out', {}); } catch (_) { /* signed out here anyway */ }
   Login.show('signed-out');
 }
 /*@end*/
@@ -1653,11 +1722,123 @@ function drawCharts() {
   S.drawnAt = Date.now();
   drawLatency(d);
   drawLoss(d);
+  placeMarks(d);
   updateLegend(d);
+}
+
+// ----- what happened: marks on the time axis ------------------------------------
+
+/** The target's events in view, those within a few pixels sharing a mark. */
+function markGroups(d, from, to, pw) {
+  const groups = [];
+  for (const e of (d && d.events) || []) {
+    if (e.ts_ms < from || e.ts_ms > to) continue;
+    const x = xAt(e.ts_ms, from, to, pw);
+    const last = groups[groups.length - 1];
+    if (last && x - last.x < 14) last.events.push(e);
+    else groups.push({ x, events: [e] });
+  }
+  return groups;
+}
+
+/** A dotted line through a chart at each mark. */
+function drawMarkLines(g, d, from, to, pw, top, bottom) {
+  const groups = markGroups(d, from, to, pw);
+  if (!groups.length) return;
+  g.save();
+  g.strokeStyle = css('--ink');
+  g.globalAlpha = 0.6;
+  g.lineWidth = 1;
+  g.setLineDash([2, 3]);
+  for (const m of groups) {
+    const xx = Math.round(m.x) + 0.5;
+    g.beginPath(); g.moveTo(xx, top); g.lineTo(xx, bottom); g.stroke();
+  }
+  g.restore();
+}
+
+const fmtAddr = (a) => a || 'an unknown address';
+
+/** One event in a sentence (for screen readers and the mark's label). */
+function eventText(e, host) {
+  if (e.kind === 'address') return `${host} changed address from ${fmtAddr(e.from)} to ${fmtAddr(e.to)}`;
+  return e.kind;
+}
+
+function eventTime(e) {
+  const [from, to] = chartRange();
+  return (to - from > 864e5 ? dayTimeFmt : timeSecFmt).format(e.ts_ms);
+}
+
+/** The marks themselves: buttons on the latency chart's time axis, so they
+ *  can be pointed at, tapped or reached with the keyboard. */
+function placeMarks(d) {
+  const box = $('#marks');
+  const cv = $('#chart');
+  const [from, to] = chartRange();
+  const groups = markGroups(d, from, to, cv.clientWidth - PAD.l - PAD.r);
+  const key = groups.map((m) => m.events.map((e) => e.ts_ms).join('+')).join(',');
+  if (box.dataset.key !== key) {
+    // New marks (the same ones only move, keeping focus).
+    const host = d ? d.target.host : '';
+    box.replaceChildren(...groups.map((m) => {
+      const label = m.events.map((e) => `${eventTime(e)}: ${eventText(e, host)}`).join('; ');
+      const b = el('button', { type: 'button', class: 'event-mark', 'aria-label': label });
+      const show = () => showMarkTip(b, m.events, host);
+      b.addEventListener('mouseenter', show);
+      b.addEventListener('focus', show);
+      b.addEventListener('click', show);
+      b.addEventListener('mouseleave', () => { if (document.activeElement !== b) hideTooltip(); });
+      b.addEventListener('blur', hideTooltip);
+      b.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.stopPropagation(); hideTooltip(); } });
+      return b;
+    }));
+    box.dataset.key = key;
+  }
+  // The tip of each mark touches the time axis.
+  const axisY = cv.offsetTop + cv.clientHeight - 4;
+  [...box.children].forEach((b, i) => {
+    b.style.left = `${cv.offsetLeft + groups[i].x}px`;
+    b.style.top = `${axisY}px`;
+  });
+}
+
+function showMarkTip(b, events, host) {
+  const tip = $('#tooltip');
+  const r = (k, v) => el('div', { class: 'r' }, el('span', { text: k }), el('strong', { text: v }));
+  const rows = [];
+  for (const e of events.slice(-4)) {
+    rows.push(el('div', { class: 't', text: eventTime(e) }));
+    if (e.kind === 'address') {
+      rows.push(el('p', { class: 'what', text: `${host} changed address` }));
+      rows.push(r('From', fmtAddr(e.from)), r('To', fmtAddr(e.to)));
+      if (e.before_ms !== null && e.after_ms !== null && e.before_ms !== undefined && e.after_ms !== undefined) {
+        rows.push(r('Average before', `${fmtMs(e.before_ms)} ms`), r('Average after', `${fmtMs(e.after_ms)} ms`));
+      }
+    } else {
+      rows.push(el('p', { class: 'what', text: e.kind }));
+    }
+  }
+  if (events.length > 4) rows.unshift(el('p', { class: 'what', text: `${events.length} changes here; the last 4:` }));
+  tip.replaceChildren(...rows);
+  tip.hidden = false;
+  // Beside the mark's line, at the top of the chart, so the change in the
+  // graph it explains stays in view: to the right, or the left if there's
+  // no room.
+  const wrap = $('.chart-wrap').getBoundingClientRect();
+  const chart = $('#chart').getBoundingClientRect();
+  const at = b.getBoundingClientRect();
+  const cx = at.left + at.width / 2 - wrap.left;
+  const tw = tip.offsetWidth;
+  const right = cx + 12, left = cx - 12 - tw;
+  const x = right + tw <= wrap.width - 4 ? right : left >= 4 ? left : Math.max(4, wrap.width - tw - 4);
+  tip.style.left = `${x}px`;
+  tip.style.top = `${chart.top - wrap.top + 8}px`;
 }
 
 function updateLegend(d) {
   const samples = !d || d.timeline.mode === 'samples';
+  $('#legend-mark').hidden = !$('#marks').children.length;
   $('#legend-avg').textContent = samples ? 'moving average' : 'average';
   $('#legend-spread').textContent = samples ? 'each sample' : 'lowest to highest';
   $('#legend-spread-key').className = samples ? 'key-sample' : 'key-band';
@@ -1771,6 +1952,7 @@ function drawLatency(d) {
       g.fillText(`${name} ${fmtAxis(v)} ms`, w - PAD.r - 4, y(v) - 2);
     }
   }
+  drawMarkLines(g, d, from, to, pw, top, bottom);
 
   g.save();
   g.beginPath();
@@ -1902,6 +2084,7 @@ function drawLoss(d) {
     g.fillStyle = ink3;
     g.fillText(`${fmtAxis(v)}%`, PAD.l - 8, yy);
   }
+  drawMarkLines(g, d, from, to, pw, top, bottom);
   g.save();
   g.beginPath(); g.rect(PAD.l, top, pw, ph); g.clip();
   g.fillStyle = lossInk();
@@ -2503,15 +2686,16 @@ async function onPassword(ev) {
   ev.preventDefault();
   const f = ev.target;
   const err = $('#password-error');
+  err.textContent = '';
   if (field(f, 'p1').value.length < 8) { err.textContent = 'Use at least 8 characters.'; return; }
-  if (field(f, 'p1').value !== field(f, 'p2').value) { err.textContent = 'The two passwords don’t match.'; return; }
+  if (field(f, 'p1').value !== field(f, 'p2').value) { err.textContent = 'The two new passwords don’t match.'; return; }
   try {
-    await api('/api/password', { json: { password: field(f, 'p1').value } });
+    await authCall('/auth/password', { current_password: field(f, 'p0').value, new_password: field(f, 'p1').value });
     f.reset();
     $('#password-dialog').close();
-    Login.show('password-changed');
+    toast('Password changed. Other devices were signed out.');
   } catch (e) {
-    err.textContent = e.message;
+    err.textContent = e.code === 'invalid_credentials' ? 'The current password isn’t right.' : e.message;
   }
 }
 
@@ -2532,16 +2716,8 @@ function deviceGuess() {
 /** Why passkeys don't work at this address, and what to do about it. */
 function unavailableNote(u, box) {
   if (!u) return false;
-  if (u.reason === 'address') {
-    box.replaceChildren('Passkeys need a name, not an IP address. Open pingrail by this server’s name, such as ',
-      el('code', { text: `${(S.cert && S.cert.names.find((n) => n.includes('.') && n !== 'localhost')) || 'its-name.local'}:${location.port || 443}` }), '.');
-  } else if (u.reason === 'custom') {
-    box.replaceChildren(`${u.name} isn’t on the certificate configured in pingrail.toml, so passkeys can’t be used at this address.`);
-  } else {
-    const add = el('button', { type: 'button', class: 'small quiet', text: `Add ${u.name}` });
-    add.addEventListener('click', () => addCertName(u.name, box, openPasskeys));
-    box.replaceChildren(`${u.name} isn’t on this server’s certificate yet. `, add);
-  }
+  box.replaceChildren('Passkeys need a name, not an IP address. Open pingrail by this server’s name, such as ',
+    el('code', { text: `${(S.cert && S.cert.names.find((n) => n.includes('.') && n !== 'localhost')) || 'its-name.local'}:${location.port || 443}` }), '.');
   return true;
 }
 
@@ -2629,7 +2805,7 @@ async function pkCall(fn) {
     if (next) { pkState = next; renderPasskeys(); }
   } catch (e) {
     if (e instanceof ApiError) {
-      if (e.status === 403) { await openPasskeys(); err.textContent = 'Confirm it’s you first.'; return; }
+      if (e.code === 'needs_recent_sign_in') { await openPasskeys(); err.textContent = 'Confirm it’s you first.'; return; }
       err.textContent = cap(e.message);
     } else {
       const why = Passkey.explain(e);
@@ -2644,17 +2820,20 @@ async function onPasskeyAdd(ev) {
   const btn = $('#pk-add-go');
   btn.disabled = true;
   await pkCall(async () => {
-    const next = await Passkey.register(label);
+    await Passkey.register(label);
     toast(`Added ${label || 'the passkey'}`);
     field(ev.target, 'label').value = '';
-    return next;
+    return api('/api/passkeys');
   });
   btn.disabled = false;
 }
 
 async function removePasskey(k) {
   if (!(await confirmBox(`Remove ${k.label}?`, 'It stops working for signing in here, and other sessions are signed out. The passkey itself stays on the device until you delete it there.', 'Remove', true))) return;
-  await pkCall(() => api(`/api/passkeys/${k.id}`, { method: 'DELETE' }));
+  await pkCall(async () => {
+    await api(`/auth/passkeys/${encodeURIComponent(k.id)}`, { method: 'DELETE' });
+    return api('/api/passkeys');
+  });
 }
 
 async function onRequiredChange(ev) {
@@ -2669,33 +2848,37 @@ async function onPasskeyConfirm(ev) {
   const err = $('#pk-error');
   err.textContent = '';
   try {
-    const me = await api('/api/me');
-    const r = await fetch('/api/login', {
-      method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: me.user, password: field(f, 'password').value }),
-    });
-    if (!r.ok) {
-      let msg = 'That password isn’t right.';
-      if (r.status !== 401) { try { msg = (await r.json()).error || msg; } catch (_) { /* not JSON */ } }
-      err.textContent = cap(msg);
-      return;
-    }
+    await authCall('/auth/confirm', { password: field(f, 'password').value });
     f.reset();
     await openPasskeys();
   } catch (e) {
-    err.textContent = cap(e.message);
+    err.textContent = e.message;
   }
 }
 
 async function onPasskeyConfirmWithPasskey() {
   await pkCall(async () => {
-    await Passkey.signIn('modal');
+    await Passkey.confirm();
     await openPasskeys();
     return null;
   });
 }
 
 // ----- set up a phone (admin) ---------------------------------------------------------
+
+/** Another name for this machine: onto the certificate, and signing in
+ *  works there too. */
+async function onPhoneName(ev) {
+  ev.preventDefault();
+  const f = ev.target;
+  const name = field(f, 'name').value.trim().replace(/\.$/, '').toLowerCase();
+  if (!name) return;
+  const note = $('#phone-note');
+  note.replaceChildren();
+  note.hidden = true;
+  await addCertName(name, note, async () => { f.reset(); await openPhone(); });
+  note.hidden = !note.textContent.trim();
+}
 
 /** The name a phone should open pingrail by: the one in the address bar
  *  when it's on the certificate, else the most specific other name. */
@@ -2725,12 +2908,8 @@ async function openPhone() {
   if (c.custom) {
     note.hidden = false;
     note.replaceChildren('This server uses a certificate configured in pingrail.toml. If the phone already trusts its issuer, only step 2 is needed.');
-  } else if (c.host && !c.host_covered) {
-    note.hidden = false;
-    const add = el('button', { type: 'button', class: 'small quiet', text: `Add ${c.host}` });
-    add.addEventListener('click', () => addCertName(c.host, note, openPhone));
-    note.replaceChildren(`You opened pingrail as ${c.host}, which isn’t on its certificate yet. `, add);
   }
+  $('#phone-name').hidden = c.custom;
   $('#station-trust').hidden = c.custom;
   $('#phone-fp').replaceChildren(...(c.ca_sha256 || '').split(':').reduce((rows, b, i) => {
     if (i % 8 === 0) rows.push([]);
@@ -3166,6 +3345,7 @@ function bind() {
   $('#pk-confirm-passkey').addEventListener('click', onPasskeyConfirmWithPasskey);
   $('#phone-open').addEventListener('click', openPhone);
   $('#phone-host').addEventListener('change', (e) => showPhoneCodes(e.target.value));
+  $('#phone-name-form').addEventListener('submit', onPhoneName);
   $('#shares-open').addEventListener('click', () => openShares());
   $('#share-new').addEventListener('click', () => openShareDialog(null, S.selected));
   $('#t-share').addEventListener('click', () => openShareDialog(null, S.selected));

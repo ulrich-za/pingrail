@@ -245,6 +245,28 @@ pub struct Detail {
     #[serde(default)]
     pub hop: Option<u8>,
     pub timeline: Timeline,
+    /// What happened to the target in the time shown, such as its name
+    /// resolving to another address, oldest first.
+    #[serde(default)]
+    pub events: Vec<TargetEvent>,
+}
+
+/// Something that happened to a target, marked on its timeline.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TargetEvent {
+    pub ts_ms: i64,
+    /// `"address"`: the target's name resolved to a different address.
+    pub kind: String,
+    /// The address before and after.
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Average round trip of what is graphed in the minutes before and after.
+    #[serde(default)]
+    pub before_ms: Option<f64>,
+    #[serde(default)]
+    pub after_ms: Option<f64>,
 }
 
 /// Latency/loss thresholds used for colouring.
@@ -310,6 +332,17 @@ pub struct Health {
     /// Signing in needs a passkey (passwords are refused).
     #[serde(default)]
     pub passkey_required: bool,
+    /// Sign-in works at the address this was asked on. pingrail answers
+    /// sign-ins only at the names and addresses on its certificate.
+    #[serde(default = "yes")]
+    pub here: bool,
+    /// When it doesn't: where it does (origins such as `https://pc.lan:8040`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_at: Vec<String>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

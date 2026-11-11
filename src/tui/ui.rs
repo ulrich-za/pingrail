@@ -425,15 +425,19 @@ fn draw_timeline(f: &mut Frame, area: Rect, app: &mut App) {
         title_spans.push(Span::styled("· Esc for destination ", Style::new().fg(Color::Yellow)));
     }
     let title = Line::from(title_spans);
-    let legend = Line::from(vec![
+    let mut legend = vec![
         Span::styled(" █", Style::new().fg(Color::Green)),
         Span::styled(" avg ", Style::new().fg(Color::Gray)),
         Span::styled("▴", Style::new().fg(Color::Gray)),
         Span::styled(" spike off-scale ", Style::new().fg(Color::Gray)),
         Span::styled("▼", Style::new().fg(Color::Red)),
         Span::styled(" loss ", Style::new().fg(Color::Gray)),
-    ])
-    .alignment(Alignment::Right);
+    ];
+    if app.detail.as_ref().is_some_and(|d| !d.events.is_empty()) {
+        legend.push(Span::styled("▲", Style::new().fg(Color::Magenta).bold()));
+        legend.push(Span::styled(" address changed ", Style::new().fg(Color::Gray)));
+    }
+    let legend = Line::from(legend).alignment(Alignment::Right);
     let b = block(title, false).title(legend);
     let inner = b.inner(area);
     f.render_widget(b, area);
@@ -475,8 +479,18 @@ fn draw_timeline(f: &mut Frame, area: Rect, app: &mut App) {
             stat("MOS", format!("{m:.2}"), Style::new());
         }
     }
+    // The latest change in view, in words.
+    if let Some(e) = d.events.iter().rev().find(|e| e.kind == "address") {
+        let when = chrono::DateTime::from_timestamp_millis(e.ts_ms)
+            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+            .unwrap_or_default();
+        let was = e.from.as_deref().unwrap_or("?");
+        let now = e.to.as_deref().unwrap_or("?");
+        spans.push(Span::styled("▲ ", Style::new().fg(Color::Magenta).bold()));
+        spans.push(Span::styled(format!("{when} address {was} → {now}"), Style::new().fg(Color::Gray)));
+    }
     f.render_widget(Line::from(spans), stats_area);
-    f.render_widget(TimelineChart { timeline: &d.timeline, th }, chart_area);
+    f.render_widget(TimelineChart { timeline: &d.timeline, th, events: &d.events }, chart_area);
 }
 
 // ----- popups ---------------------------------------------------------------

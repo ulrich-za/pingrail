@@ -1,4 +1,6 @@
-//! SQLite storage for targets, samples, users and web sessions.
+//! SQLite storage for targets, samples, share links and settings. Accounts,
+//! passkeys and sessions are doorward's, in its own `auth_` tables in the
+//! same file (see `auth`).
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -7,7 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::config::now_ms;
-use crate::model::{NewTarget, Share, ShareSettings, Target, TargetPatch};
+use crate::model::{NewTarget, Share, ShareSettings, Target, TargetEvent, TargetPatch};
 
 /// How a hop probe was answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,22 +157,14 @@ CREATE TABLE IF NOT EXISTS hops (
     data BLOB NOT NULL,
     PRIMARY KEY (target_id, ts_ms)
 ) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, phc TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS web_sessions (
-    token TEXT PRIMARY KEY,
-    username TEXT NOT NULL,
-    expires_ms INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS passkeys (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL,
-    rp_id TEXT NOT NULL,
-    cred_id TEXT NOT NULL UNIQUE,
-    passkey TEXT NOT NULL,
-    label TEXT NOT NULL,
-    created_ms INTEGER NOT NULL,
-    last_used_ms INTEGER
-);
+CREATE TABLE IF NOT EXISTS target_events (
+    target_id INTEGER NOT NULL,
+    ts_ms INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    old TEXT,
+    new TEXT,
+    PRIMARY KEY (target_id, ts_ms, kind)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS shares (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     token TEXT NOT NULL UNIQUE,
@@ -204,67 +198,50 @@ fn migrate(c: &Connection) -> Result<()> {
     if !rcols.iter().any(|c| c == "interval_ms") {
         c.execute_batch("ALTER TABLE rounds ADD COLUMN interval_ms INTEGER")?;
     }
-    let ucols: Vec<String> = c
-        .prepare("PRAGMA table_info(users)")?
-        .query_map([], |r| r.get::<_, String>(1))?
-        .collect::<rusqlite::Result<_>>()?;
-    if !ucols.iter().any(|c| c == "uuid") {
-        // The user handle passkeys carry (random, never shown).
-        c.execute_batch("ALTER TABLE users ADD COLUMN uuid TEXT")?;
-    }
-    let scols: Vec<String> = c
-        .prepare("PRAGMA table_info(web_sessions)")?
-        .query_map([], |r| r.get::<_, String>(1))?
-        .collect::<rusqlite::Result<_>>()?;
-    if !scols.iter().any(|c| c == "auth_ms") {
-        // When the session's user last proved who they are.
-        c.execute_batch("ALTER TABLE web_sessions ADD COLUMN auth_ms INTEGER")?;
+    if !cols.iter().any(|c| c == "last_ip") {
+        // The address the target's name last resolved to, so a change is
+        // noticed across restarts too.
+        c.execute_batch("ALTER TABLE targets ADD COLUMN last_ip TEXT")?;
     }
     sanitize_names(c)?;
-    hash_session_tokens(c)?;
     Ok(())
 }
 
-/// Web sessions are looked up by the SHA-256 of their cookie, so a copy of
-/// the database can't be used to sign in. Sessions saved before that are
-/// converted once, without signing anyone out.
-fn hash_session_tokens(c: &Connection) -> Result<()> {
-    let done: Option<String> =
-        c.query_row("SELECT value FROM meta WHERE key='web_sessions_hashed'", [], |r| r.get(0)).optional()?;
-    if done.is_some() {
-        return Ok(());
-    }
-    let tokens: Vec<String> = c
-        .prepare("SELECT token FROM web_sessions")?
-        .query_map([], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    for t in tokens {
-        c.execute("UPDATE web_sessions SET token=?2 WHERE token=?1", params![t, session_key(&t)])?;
-    }
-    c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('web_sessions_hashed', '1')", [])?;
-    Ok(())
+fn table_exists(c: &Connection, name: &str) -> Result<bool> {
+    Ok(c.query_row("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1", [name], |_| Ok(()))
+        .optional()?
+        .is_some())
 }
 
+fn columns(c: &Connection, table: &str) -> Result<Vec<String>> {
+    Ok(c.prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// A web UI account saved by pingrail 0.3 or earlier, before sign-in moved
+/// to doorward.
 #[derive(Debug, Clone)]
-pub struct PasskeyRow {
-    pub id: i64,
+pub struct LegacyUser {
+    pub username: String,
+    /// Argon2id PHC string.
+    pub phc: String,
+    /// The passkey user handle (made the first time a passkey was added).
+    pub uuid: Option<String>,
+}
+
+/// A passkey saved by pingrail 0.3.
+#[derive(Debug, Clone)]
+pub struct LegacyPasskey {
     pub username: String,
     pub rp_id: String,
+    /// base64url.
+    pub cred_id: String,
     /// webauthn-rs's Passkey as JSON.
     pub passkey: String,
     pub label: String,
     pub created_ms: i64,
     pub last_used_ms: Option<i64>,
-}
-
-fn uuid_string(b: &[u8; 16]) -> String {
-    let h = hex::encode(b);
-    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
-}
-
-/// What a session cookie is stored as.
-fn session_key(token: &str) -> String {
-    hex::encode(ring::digest::digest(&ring::digest::SHA256, token.as_bytes()))
 }
 
 /// Names typed before pingrail cleaned input (or imported from hopwatch) may
@@ -443,6 +420,7 @@ impl Store {
         let n = tx.execute("DELETE FROM targets WHERE id=?1", [id])?;
         tx.execute("DELETE FROM rounds WHERE target_id=?1", [id])?;
         tx.execute("DELETE FROM hops WHERE target_id=?1", [id])?;
+        tx.execute("DELETE FROM target_events WHERE target_id=?1", [id])?;
         tx.commit()?;
         Ok(n > 0)
     }
@@ -721,6 +699,7 @@ impl Store {
         for id in targets {
             n += c.execute("DELETE FROM rounds WHERE target_id=?1 AND ts_ms < ?2", params![id, before_ms])?;
             n += c.execute("DELETE FROM hops WHERE target_id=?1 AND ts_ms < ?2", params![id, before_ms])?;
+            c.execute("DELETE FROM target_events WHERE target_id=?1 AND ts_ms < ?2", params![id, before_ms])?;
         }
         Ok(n)
     }
@@ -745,7 +724,7 @@ impl Store {
         let c = self.write.lock().unwrap();
         let a = c.execute("DELETE FROM rounds WHERE ts_ms < ?1", [before_ms])?;
         let b = c.execute("DELETE FROM hops WHERE ts_ms < ?1", [before_ms])?;
-        c.execute("DELETE FROM web_sessions WHERE expires_ms < ?1", [now_ms()])?;
+        c.execute("DELETE FROM target_events WHERE ts_ms < ?1", [before_ms])?;
         Ok(a + b)
     }
 
@@ -765,152 +744,95 @@ impl Store {
         Ok(())
     }
 
-    // ----- users & web sessions -----------------------------------------
+    // ----- what targets resolve to --------------------------------------
 
-    pub fn has_users(&self) -> Result<bool> {
+    /// The address a target's name last resolved to.
+    pub fn target_last_ip(&self, id: i64) -> Result<Option<String>> {
         let c = self.reader();
-        let n: i64 = c.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
-        Ok(n > 0)
+        Ok(c.query_row("SELECT last_ip FROM targets WHERE id=?1", [id], |r| r.get(0)).optional()?.flatten())
     }
 
-    pub fn set_user(&self, username: &str, phc: &str) -> Result<()> {
-        let c = self.write.lock().unwrap();
-        c.execute(
-            "INSERT INTO users (username, phc) VALUES (?1, ?2)
-             ON CONFLICT(username) DO UPDATE SET phc=excluded.phc",
-            params![username, phc],
-        )?;
-        // Changing a password signs that user out everywhere.
-        c.execute("DELETE FROM web_sessions WHERE username=?1", [username])?;
-        Ok(())
-    }
-
-    pub fn user_phc(&self, username: &str) -> Result<Option<String>> {
-        let c = self.reader();
-        Ok(c.query_row("SELECT phc FROM users WHERE username=?1", [username], |r| r.get(0))
-            .optional()?)
-    }
-
-    /// Save a password hashed with newer settings, unless the password was
-    /// changed meanwhile. Nobody is signed out.
-    pub fn rehash_user(&self, username: &str, old_phc: &str, new_phc: &str) -> Result<()> {
-        let c = self.write.lock().unwrap();
-        c.execute("UPDATE users SET phc=?3 WHERE username=?1 AND phc=?2", params![username, old_phc, new_phc])?;
-        Ok(())
-    }
-
-    pub fn create_web_session(&self, token: &str, username: &str, expires_ms: i64) -> Result<()> {
-        let c = self.write.lock().unwrap();
-        c.execute(
-            "INSERT INTO web_sessions (token, username, expires_ms, auth_ms) VALUES (?1, ?2, ?3, ?4)",
-            params![session_key(token), username, expires_ms, now_ms()],
-        )?;
-        Ok(())
-    }
-
-    /// A session's user and when they last signed in or confirmed it was them.
-    pub fn web_session(&self, token: &str) -> Result<Option<(String, i64)>> {
-        let c = self.reader();
-        Ok(c.query_row(
-            "SELECT username, COALESCE(auth_ms, 0) FROM web_sessions WHERE token=?1 AND expires_ms > ?2",
-            params![session_key(token), now_ms()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?)
-    }
-
-    /// Sign `username` out everywhere except the session `keep`.
-    pub fn end_other_sessions(&self, username: &str, keep: Option<&str>) -> Result<usize> {
-        let c = self.write.lock().unwrap();
-        Ok(c.execute(
-            "DELETE FROM web_sessions WHERE username=?1 AND token<>?2",
-            params![username, keep.map(session_key).unwrap_or_default()],
-        )?)
-    }
-
-    // ----- passkeys --------------------------------------------------------
-
-    /// The user's passkey handle, made on first use.
-    pub fn user_uuid(&self, username: &str) -> Result<Option<String>> {
-        let c = self.write.lock().unwrap();
-        let row: Option<Option<String>> =
-            c.query_row("SELECT uuid FROM users WHERE username=?1", [username], |r| r.get(0)).optional()?;
-        match row {
-            None => Ok(None),
-            Some(Some(u)) => Ok(Some(u)),
-            Some(None) => {
-                let mut b = [0u8; 16];
-                getrandom::fill(&mut b).map_err(|e| anyhow::anyhow!("random: {e}"))?;
-                b[6] = (b[6] & 0x0f) | 0x40;
-                b[8] = (b[8] & 0x3f) | 0x80;
-                let u = uuid_string(&b);
-                c.execute("UPDATE users SET uuid=?2 WHERE username=?1", params![username, u])?;
-                Ok(Some(u))
-            }
+    /// A target's name now resolves to `new`; when it resolved to something
+    /// else before (`old`), that is recorded as a change at `ts_ms`.
+    pub fn record_address(&self, id: i64, ts_ms: i64, old: Option<&str>, new: &str) -> Result<()> {
+        let mut c = self.write.lock().unwrap();
+        let tx = c.transaction()?;
+        let n = tx.execute("UPDATE targets SET last_ip=?2 WHERE id=?1", params![id, new])?;
+        if n > 0
+            && let Some(old) = old
+            && old != new
+        {
+            tx.execute(
+                "INSERT OR REPLACE INTO target_events (target_id, ts_ms, kind, old, new) VALUES (?1, ?2, 'address', ?3, ?4)",
+                params![id, ts_ms, old, new],
+            )?;
         }
+        tx.commit()?;
+        Ok(())
     }
 
-    pub fn user_by_uuid(&self, uuid: &str) -> Result<Option<String>> {
-        let c = self.reader();
-        Ok(c.query_row("SELECT username FROM users WHERE uuid=?1", [uuid], |r| r.get(0)).optional()?)
-    }
-
-    /// Passkeys, of one user or everyone's, for one relying party or all.
-    pub fn passkeys(&self, username: Option<&str>, rp_id: Option<&str>) -> Result<Vec<PasskeyRow>> {
+    /// What happened to a target in `[from, to)`, oldest first (at most
+    /// `limit`, the latest ones).
+    pub fn target_events(&self, id: i64, from: i64, to: i64, limit: usize) -> Result<Vec<TargetEvent>> {
         let c = self.reader();
         let mut st = c.prepare(
-            "SELECT id, username, rp_id, passkey, label, created_ms, last_used_ms FROM passkeys
-             WHERE (?1 IS NULL OR username=?1) AND (?2 IS NULL OR rp_id=?2) ORDER BY id",
+            "SELECT ts_ms, kind, old, new FROM target_events WHERE target_id=?1 AND ts_ms >= ?2 AND ts_ms < ?3
+             ORDER BY ts_ms DESC LIMIT ?4",
         )?;
-        let rows = st
-            .query_map(params![username, rp_id], |r| {
-                Ok(PasskeyRow {
-                    id: r.get(0)?,
-                    username: r.get(1)?,
-                    rp_id: r.get(2)?,
-                    passkey: r.get(3)?,
-                    label: r.get(4)?,
-                    created_ms: r.get(5)?,
-                    last_used_ms: r.get(6)?,
-                })
+        let mut v = st
+            .query_map(params![id, from, to, limit as i64], |r| {
+                Ok(TargetEvent { ts_ms: r.get(0)?, kind: r.get(1)?, from: r.get(2)?, to: r.get(3)?, ..Default::default() })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        v.reverse();
+        Ok(v)
     }
 
-    pub fn add_passkey(&self, username: &str, rp_id: &str, cred_id: &str, passkey: &str, label: &str) -> Result<i64> {
+    // ----- accounts saved by pingrail 0.3 ---------------------------------
+
+    /// Web UI accounts and passkeys saved before sign-in moved to doorward,
+    /// or `None` once they have been moved (see `auth`).
+    pub fn legacy_accounts(&self) -> Result<Option<(Vec<LegacyUser>, Vec<LegacyPasskey>)>> {
         let c = self.write.lock().unwrap();
-        c.execute(
-            "INSERT INTO passkeys (username, rp_id, cred_id, passkey, label, created_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![username, rp_id, cred_id, passkey, label, now_ms()],
+        if !table_exists(&c, "users")? {
+            return Ok(None);
+        }
+        let with_uuid = columns(&c, "users")?.iter().any(|n| n == "uuid");
+        let sql = if with_uuid { "SELECT username, phc, uuid FROM users" } else { "SELECT username, phc, NULL FROM users" };
+        let users = c
+            .prepare(sql)?
+            .query_map([], |r| Ok(LegacyUser { username: r.get(0)?, phc: r.get(1)?, uuid: r.get(2)? }))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let passkeys = if table_exists(&c, "passkeys")? {
+            c.prepare("SELECT username, rp_id, cred_id, passkey, label, created_ms, last_used_ms FROM passkeys ORDER BY id")?
+                .query_map([], |r| {
+                    Ok(LegacyPasskey {
+                        username: r.get(0)?,
+                        rp_id: r.get(1)?,
+                        cred_id: r.get(2)?,
+                        passkey: r.get(3)?,
+                        label: r.get(4)?,
+                        created_ms: r.get(5)?,
+                        last_used_ms: r.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        Ok(Some((users, passkeys)))
+    }
+
+    /// Remove pingrail 0.3's account tables once doorward has their contents
+    /// (their sessions are left behind: everyone signs in once).
+    pub fn drop_legacy_accounts(&self) -> Result<()> {
+        let mut c = self.write.lock().unwrap();
+        let tx = c.transaction()?;
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS web_sessions; DROP TABLE IF EXISTS passkeys; DROP TABLE IF EXISTS users;
+             DELETE FROM meta WHERE key IN ('argon2_policy', 'web_sessions_hashed');",
         )?;
-        Ok(c.last_insert_rowid())
-    }
-
-    /// Record a sign-in with a passkey (and its updated counter, if any).
-    pub fn passkey_used(&self, id: i64, passkey: Option<&str>) -> Result<()> {
-        let c = self.write.lock().unwrap();
-        c.execute(
-            "UPDATE passkeys SET last_used_ms=?2, passkey=COALESCE(?3, passkey) WHERE id=?1",
-            params![id, now_ms(), passkey],
-        )?;
-        Ok(())
-    }
-
-    /// Remove a passkey (only `username`'s, when given).
-    pub fn delete_passkey(&self, id: i64, username: Option<&str>) -> Result<bool> {
-        let c = self.write.lock().unwrap();
-        Ok(c.execute("DELETE FROM passkeys WHERE id=?1 AND (?2 IS NULL OR username=?2)", params![id, username])? > 0)
-    }
-
-    pub fn delete_all_passkeys(&self) -> Result<usize> {
-        let c = self.write.lock().unwrap();
-        Ok(c.execute("DELETE FROM passkeys", [])?)
-    }
-
-    pub fn delete_web_session(&self, token: &str) -> Result<()> {
-        let c = self.write.lock().unwrap();
-        c.execute("DELETE FROM web_sessions WHERE token=?1", [session_key(token)])?;
+        tx.commit()?;
         Ok(())
     }
 }
@@ -980,35 +902,65 @@ mod tests {
     }
 
     #[test]
-    fn sessions_are_stored_hashed_and_old_ones_converted() {
+    fn accounts_from_0_3_are_handed_over_then_dropped() {
         let dir = std::env::temp_dir().join(format!("pingrail-test-{}", crate::config::random_hex(4)));
         let db = dir.join("t.db");
-        // A database from before hashing, with one plain-text session.
         {
             std::fs::create_dir_all(&dir).unwrap();
             let c = Connection::open(&db).unwrap();
-            c.execute_batch(SCHEMA).unwrap();
-            c.execute("INSERT INTO web_sessions VALUES ('oldcookie', 'admin', ?1)", [now_ms() + 60_000]).unwrap();
+            c.execute_batch(
+                "CREATE TABLE users (username TEXT PRIMARY KEY, phc TEXT NOT NULL, uuid TEXT);
+                 CREATE TABLE web_sessions (token TEXT PRIMARY KEY, username TEXT NOT NULL, expires_ms INTEGER NOT NULL, auth_ms INTEGER);
+                 CREATE TABLE passkeys (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, rp_id TEXT NOT NULL,
+                     cred_id TEXT NOT NULL UNIQUE, passkey TEXT NOT NULL, label TEXT NOT NULL, created_ms INTEGER NOT NULL, last_used_ms INTEGER);
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO users VALUES ('admin', '$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA', '0f8c2b1e-3c4d-4e5f-8a9b-0c1d2e3f4a5b');
+                 INSERT INTO web_sessions VALUES ('abc', 'admin', 99999999999999, 0);
+                 INSERT INTO passkeys (username, rp_id, cred_id, passkey, label, created_ms) VALUES ('admin', 'pc.lan', 'AAEC', '{}', 'Phone', 5);
+                 INSERT INTO meta VALUES ('argon2_policy', '{}'), ('passkey_required', '1');",
+            )
+            .unwrap();
         }
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.web_session("oldcookie").unwrap().map(|x| x.0).as_deref(), Some("admin"));
-        s.create_web_session("newcookie", "admin", now_ms() + 60_000).unwrap();
-        let stored: Vec<String> = s
-            .reader()
-            .prepare("SELECT token FROM web_sessions")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert!(!stored.iter().any(|t| t.contains("cookie")), "{stored:?}");
-        assert_eq!(s.web_session(&session_key("newcookie")).unwrap(), None);
-        s.delete_web_session("newcookie").unwrap();
-        assert_eq!(s.web_session("newcookie").unwrap(), None);
-        // Converted once only.
+        let (users, keys) = s.legacy_accounts().unwrap().expect("0.3 tables found");
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].uuid.as_deref(), Some("0f8c2b1e-3c4d-4e5f-8a9b-0c1d2e3f4a5b"));
+        assert_eq!((keys[0].rp_id.as_str(), keys[0].cred_id.as_str(), keys[0].label.as_str()), ("pc.lan", "AAEC", "Phone"));
+        s.drop_legacy_accounts().unwrap();
+        assert!(s.legacy_accounts().unwrap().is_none(), "gone once handed over");
+        assert_eq!(s.meta_get("argon2_policy").unwrap(), None);
+        assert_eq!(s.meta_get("passkey_required").unwrap().as_deref(), Some("1"), "pingrail's own setting stays");
         drop(s);
+        // Reopening doesn't bring the tables back.
         let s = Store::open(&db).unwrap();
-        assert_eq!(s.web_session("oldcookie").unwrap().map(|x| x.0).as_deref(), Some("admin"));
+        assert!(s.legacy_accounts().unwrap().is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn address_changes_are_recorded_once() {
+        let dir = std::env::temp_dir().join(format!("pingrail-test-{}", crate::config::random_hex(4)));
+        let s = Store::open(&dir.join("t.db")).unwrap();
+        let t = s.add_target(&NewTarget { host: "cdn.example.com".into(), ..Default::default() }, 1000).unwrap();
+        assert_eq!(s.target_last_ip(t.id).unwrap(), None);
+        s.record_address(t.id, 1_000, None, "192.0.2.7").unwrap();
+        s.record_address(t.id, 2_000, Some("192.0.2.7"), "192.0.2.7").unwrap();
+        assert!(s.target_events(t.id, 0, i64::MAX, 10).unwrap().is_empty(), "no change, no event");
+        s.record_address(t.id, 3_000, Some("192.0.2.7"), "198.51.100.10").unwrap();
+        s.record_address(t.id, 4_000, Some("198.51.100.10"), "192.0.2.7").unwrap();
+        assert_eq!(s.target_last_ip(t.id).unwrap().as_deref(), Some("192.0.2.7"));
+        let ev = s.target_events(t.id, 0, i64::MAX, 10).unwrap();
+        assert_eq!(ev.len(), 2);
+        assert_eq!((ev[0].ts_ms, ev[0].from.as_deref(), ev[0].to.as_deref()), (3_000, Some("192.0.2.7"), Some("198.51.100.10")));
+        assert_eq!(ev[0].kind, "address");
+        assert_eq!(s.target_events(t.id, 3_500, i64::MAX, 10).unwrap().len(), 1, "range");
+        assert_eq!(s.target_events(t.id, 0, i64::MAX, 1).unwrap()[0].ts_ms, 4_000, "the latest when capped");
+        s.prune(3_500).unwrap();
+        assert_eq!(s.target_events(t.id, 0, i64::MAX, 10).unwrap().len(), 1, "pruned with the samples");
+        s.delete_target(t.id).unwrap();
+        assert!(s.target_events(t.id, 0, i64::MAX, 10).unwrap().is_empty());
+        s.record_address(t.id, 5_000, Some("a"), "b").unwrap();
+        assert!(s.target_events(t.id, 0, i64::MAX, 10).unwrap().is_empty(), "nothing for a deleted target");
         std::fs::remove_dir_all(dir).ok();
     }
 

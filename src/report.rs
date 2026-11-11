@@ -439,9 +439,11 @@ fn build_pages(details: &[Detail], req: &ReportRequest, th: Thresholds) -> Vec<S
     const MORE_ROWS: usize = 46;
     for d in details {
         let c = &c;
-        let first: Vec<&HopStat> = d.hops.iter().take(FIRST_ROWS).collect();
+        // The list of changes under the chart takes room from the route.
+        let first_rows = FIRST_ROWS - (events_height(d) / 14.5).ceil() as usize;
+        let first: Vec<&HopStat> = d.hops.iter().take(first_rows).collect();
         pages.push(Box::new(move |svg| target_page(svg, c, d, &first)));
-        let rest: Vec<&HopStat> = d.hops.iter().skip(FIRST_ROWS).collect();
+        let rest: Vec<&HopStat> = d.hops.iter().skip(first_rows).collect();
         for chunk in rest.chunks(MORE_ROWS) {
             let rows = chunk.to_vec();
             pages.push(Box::new(move |svg| route_continued_page(svg, c, d, &rows)));
@@ -787,6 +789,21 @@ fn latency_chart(svg: &mut Svg, c: &Ctx, d: &Detail, top: f64, height: f64, loss
         }
     }
 
+    // Changes (such as a new address): a dotted line through both charts
+    // and a numbered mark on the time axis.
+    let marks = event_marks(d, &xf);
+    for (k, (x, _)) in marks.iter().enumerate() {
+        for (a, b) in [(py0, py1), (ly0, ly1)] {
+            svg.b.push_str(&format!(
+                r#"<line x1="{x:.2}" y1="{a:.2}" x2="{x:.2}" y2="{b:.2}" stroke="{ACCENT}" stroke-width="0.6" stroke-dasharray="1.5 2" stroke-opacity="0.7"/>"#
+            ));
+        }
+        mark_glyph(svg, *x, py1);
+        if d.events.len() > 1 {
+            svg.text(*x, py1 + 13.5, 6.0, ACCENT, Anchor::Middle, true, false, &(k + 1).to_string());
+        }
+    }
+
     // Points are joined across lost samples; only real gaps break the line.
     // Each point sits in the middle of the time it covers.
     let mid = |p: &crate::model::Point| xf(p.t_ms) + if samples { 0.0 } else { pt_w / 2.0 };
@@ -866,8 +883,92 @@ fn latency_chart(svg: &mut Svg, c: &Ctx, d: &Detail, top: f64, height: f64, loss
     }
     // What a point means
     svg.text(x0, ly1 + 24.0, 6.8, INK3, Anchor::Start, false, false, &timeline_caption(tl));
-    ly1 + 24.0
+    events_list(svg, c, d, &marks, x0, ly1 + 24.0)
 }
+
+/// Changes listed under a chart, at most this many.
+const EVENTS_LISTED: usize = 3;
+const EVENT_LINE_H: f64 = 9.5;
+
+/// How much room the list of changes under the chart takes.
+fn events_height(d: &Detail) -> f64 {
+    let n = d.events.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let lines = n.min(EVENTS_LISTED) + usize::from(n > EVENTS_LISTED);
+    4.0 + lines as f64 * EVENT_LINE_H
+}
+
+/// The target's events grouped into marks: events within a few points of
+/// each other share one, numbered from 1. Each is (x, numbers of its events).
+fn event_marks(d: &Detail, xf: &dyn Fn(i64) -> f64) -> Vec<(f64, Vec<usize>)> {
+    let mut marks: Vec<(f64, Vec<usize>)> = Vec::new();
+    for (i, e) in d.events.iter().enumerate() {
+        let x = xf(e.ts_ms);
+        match marks.last_mut() {
+            Some((lx, ids)) if x - *lx < 7.0 => ids.push(i),
+            _ => marks.push((x, vec![i])),
+        }
+    }
+    marks
+}
+
+/// A small triangle pointing up with its tip at (x, y).
+fn mark_glyph(svg: &mut Svg, x: f64, y: f64) {
+    svg.b.push_str(&format!(
+        r#"<path d="M{x:.2} {y:.2} L{:.2} {:.2} L{:.2} {:.2} Z" fill="{ACCENT}"/>"#,
+        x - 3.2,
+        y + 5.5,
+        x + 3.2,
+        y + 5.5
+    ));
+}
+
+/// One line per change (the latest few) under the chart, each with the
+/// number of its mark. Returns where the list ends.
+fn events_list(svg: &mut Svg, c: &Ctx, d: &Detail, marks: &[(f64, Vec<usize>)], x0: f64, y: f64) -> f64 {
+    let n = d.events.len();
+    if n == 0 {
+        return y;
+    }
+    let span = d.timeline.to_ms - d.timeline.from_ms;
+    let fmt = if span <= 2 * 86_400_000 { "%H:%M:%S" } else { "%-d %b %H:%M" };
+    let mut y = y + 4.0;
+    if n > EVENTS_LISTED {
+        y += EVENT_LINE_H;
+        let more = n - EVENTS_LISTED;
+        let what = if more == 1 { "1 earlier change".to_string() } else { format!("{more} earlier changes") };
+        svg.text(x0, y, 6.8, INK3, Anchor::Start, false, false, &format!("{what} in this period are marked above."));
+    }
+    for (i, e) in d.events.iter().enumerate().skip(n.saturating_sub(EVENTS_LISTED)) {
+        y += EVENT_LINE_H;
+        mark_glyph(svg, x0 + 3.2, y - 6.0);
+        // Numbered like the marks on the chart when there's more than one.
+        if n > 1 {
+            let no = marks.iter().position(|(_, ids)| ids.contains(&i)).map_or(0, |m| m + 1);
+            svg.text(x0 + 9.0, y, 6.8, ACCENT, Anchor::Start, true, false, &no.to_string());
+        }
+        let when = local(e.ts_ms, c.tz).format(fmt).to_string();
+        let mut what = match e.kind.as_str() {
+            "address" => format!(
+                "{} changed address from {} to {}",
+                d.target.host,
+                e.from.as_deref().unwrap_or("an unknown address"),
+                e.to.as_deref().unwrap_or("an unknown address")
+            ),
+            k => k.to_string(),
+        };
+        if let (Some(b), Some(a)) = (e.before_ms, e.after_ms) {
+            what.push_str(&format!(" · average {} ms before, {} ms after", fmt_ms(Some(b)), fmt_ms(Some(a))));
+        }
+        svg.text(x0 + 22.0, y, 6.8, INK2, Anchor::Start, false, true, &when);
+        let tx = x0 + 22.0 + text_w(&when, 6.8, true, false) + 6.0;
+        svg.text(tx, y, 6.8, INK2, Anchor::Start, false, false, &truncate(&what, W - M - tx, 6.8, false));
+    }
+    y
+}
+
 
 fn fmt_axis(v: f64) -> String {
     if v == 0.0 {

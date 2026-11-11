@@ -268,6 +268,7 @@ mod tests {
                 "confirm-dialog",
                 "passkeys-dialog",
                 "phone-dialog",
+                "phone-name",
                 "passkey-signin",
                 "t-share",
                 "t-bg",
@@ -278,8 +279,8 @@ mod tests {
                 assert!(!html.contains(admin_only), "share page {v:?} contains {admin_only}");
             }
             for admin_code in [
-                "/api/login", "/api/ping", "/api/password", "/api/shares", "/api/logout", "/api/me", "Login.show", "onShareSave",
-                "/api/passkey", "/api/certificate", "/api/qr", "navigator.credentials",
+                "/auth/", "authCall", "AUTH_WORDS", "/api/ping", "/api/password", "/api/shares", "/api/me", "Login.show",
+                "onShareSave", "/api/passkey", "/api/certificate", "/api/qr", "navigator.credentials", "onPhoneName",
             ] {
                 assert!(!js.contains(admin_code), "share script {v:?} contains {admin_code}");
             }

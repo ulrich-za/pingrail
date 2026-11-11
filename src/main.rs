@@ -1,6 +1,7 @@
 //! pingrail — multi-target ping and route monitor.
 
 mod analysis;
+mod auth;
 mod ca;
 mod client;
 mod config;
@@ -11,8 +12,6 @@ mod migrate;
 mod model;
 mod netpolicy;
 mod pages;
-mod passkeys;
-mod password;
 mod probe;
 mod report;
 mod server;
@@ -20,7 +19,6 @@ mod service;
 mod share;
 mod stats;
 mod store;
-mod sysmem;
 mod tls;
 mod tui;
 mod util;
@@ -172,8 +170,8 @@ enum ServiceCmd {
 enum PasskeyCmd {
     /// List everyone's passkeys
     List,
-    /// Remove one passkey (by the number `list` shows)
-    Remove { id: i64 },
+    /// Remove one passkey (by its id from `list`; the first few characters do)
+    Remove { id: String },
     /// Remove every passkey and allow signing in with a password again
     Reset,
 }
@@ -508,6 +506,32 @@ where
     f(client).await
 }
 
+/// The database to work on directly when the service can't be reached.
+fn local_db(conn: &Conn, local: bool) -> Result<PathBuf> {
+    let paths = if local { conn.local_paths() } else { conn.paths.clone() };
+    let db = paths.db_file();
+    if !db.exists() {
+        bail!("the service isn't reachable and there's no database at {}", db.display());
+    }
+    Ok(db)
+}
+
+/// On Linux, files root made in the service's data folder go to the
+/// service's own user.
+fn give_back_to_service(conn: &Conn, local: bool) {
+    #[cfg(unix)]
+    if service::is_root() && !local {
+        for f in ["pingrail.db", "pingrail.db-wal", "pingrail.db-shm"] {
+            let p = conn.paths.data_dir.join(f);
+            if p.exists() {
+                let _ = std::process::Command::new("chown").args(["pingrail:pingrail", &p.to_string_lossy()]).status();
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (conn, local);
+}
+
 /// `pingrail passkeys …`: through the running service when there is one,
 /// otherwise straight in the database (so `reset` works even when the
 /// service won't start or nobody can sign in).
@@ -520,74 +544,67 @@ async fn passkeys_cmd(conn: Conn, local: bool, action: PasskeyCmd) -> Result<()>
             _ => None,
         }
     };
-    let open_db = || -> Result<std::sync::Arc<store::Store>> {
-        let paths = if local { conn.local_paths() } else { conn.paths.clone() };
-        let db = paths.db_file();
-        if !db.exists() {
-            bail!("the service isn't reachable and there's no database at {}", db.display());
-        }
-        store::Store::open(&db).with_context(|| format!("opening {}", db.display()))
+    let offline = || async {
+        let db = local_db(&conn, local)?;
+        let dw = auth::offline(&db).await?;
+        Ok::<_, anyhow::Error>((db, dw))
     };
     match action {
         PasskeyCmd::List => {
-            let rows: Vec<(i64, String, String, String, i64, Option<i64>)> = match &client {
+            let (keys, required): (Vec<auth::PasskeyView>, bool) = match &client {
                 Some(c) => {
                     let v = c.passkeys().await?;
-                    v["passkeys"]
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|p| {
-                            (
-                                p["id"].as_i64().unwrap_or(0),
-                                p["user"].as_str().unwrap_or("").to_string(),
-                                p["label"].as_str().unwrap_or("").to_string(),
-                                p["rp_id"].as_str().unwrap_or("").to_string(),
-                                p["created_ms"].as_i64().unwrap_or(0),
-                                p["last_used_ms"].as_i64(),
-                            )
-                        })
-                        .collect()
+                    (serde_json::from_value(v["passkeys"].clone()).unwrap_or_default(), v["required"].as_bool().unwrap_or(false))
                 }
-                None => open_db()?
-                    .passkeys(None, None)?
-                    .into_iter()
-                    .map(|r| (r.id, r.username, r.label, r.rp_id, r.created_ms, r.last_used_ms))
-                    .collect(),
+                None => {
+                    let (db, dw) = offline().await?;
+                    let required = store::peek_meta(&db, auth::REQUIRED_KEY).as_deref() == Some("1");
+                    (auth::all_passkeys(&dw).await.map_err(auth::cli_error)?, required)
+                }
             };
-            let required = match &client {
-                Some(c) => c.passkeys().await?["required"].as_bool().unwrap_or(false),
-                None => passkeys::required(&*open_db()?),
-            };
-            if rows.is_empty() {
+            if keys.is_empty() {
                 println!("No passkeys.");
             }
-            for (id, user, label, rp, created, used) in rows {
-                let when = |ms: i64| chrono::DateTime::from_timestamp_millis(ms).map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string()).unwrap_or_default();
+            let when = |ms: i64| {
+                chrono::DateTime::from_timestamp_millis(ms)
+                    .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+                    .unwrap_or_default()
+            };
+            for k in keys {
                 println!(
-                    "{id:>4}  {user:<12} {label:<24} {rp:<28} added {}{}",
-                    when(created),
-                    used.map(|u| format!(", last used {}", when(u))).unwrap_or_default()
+                    "{}  {:<12} {:<24} {:<28} added {}{}",
+                    &k.id[..8],
+                    k.user.as_deref().unwrap_or(""),
+                    k.label,
+                    k.rp_id,
+                    when(k.created_ms),
+                    k.last_used_ms.map(|u| format!(", last used {}", when(u))).unwrap_or_default()
                 );
             }
             println!("Signing in {}.", if required { "needs a passkey" } else { "works with a passkey or the password" });
         }
         PasskeyCmd::Remove { id } => {
-            match &client {
-                Some(c) => c.remove_passkey(id).await?,
+            let k = match &client {
+                Some(c) => c.remove_passkey(&id).await?,
                 None => {
-                    if !open_db()?.delete_passkey(id, None)? {
-                        bail!("no passkey {id}");
-                    }
+                    let (db, dw) = offline().await?;
+                    let store = store::Store::open(&db)?;
+                    let k = auth::remove_passkey(&dw, &store, &id).await?;
+                    give_back_to_service(&conn, local);
+                    k
                 }
-            }
-            println!("Removed passkey {id}.");
+            };
+            println!("Removed passkey {} ({}, for {}).", &k.id[..8], k.label, k.rp_id);
         }
         PasskeyCmd::Reset => {
             match &client {
                 Some(c) => c.reset_passkeys().await?,
-                None => passkeys::reset_store(&*open_db()?)?,
+                None => {
+                    let (db, dw) = offline().await?;
+                    let store = store::Store::open(&db)?;
+                    auth::reset_passkeys(&dw, &store).await?;
+                    give_back_to_service(&conn, local);
+                }
             }
             println!("Removed every passkey. Signing in works with the password again (set one with `pingrail passwd`).");
         }
@@ -603,20 +620,18 @@ async fn tune_passwords(conn: Conn, local: bool) -> Result<()> {
         c.health().await?;
         c.tune_passwords().await
     };
-    let policy = match if local { Err(anyhow!("local")) } else { via_api.await } {
-        Ok(p) => p,
+    let described = match if local { Err(anyhow!("local")) } else { via_api.await } {
+        Ok(d) => d,
         Err(e) => {
-            let paths = if local { conn.local_paths() } else { conn.paths.clone() };
-            let db = paths.db_file();
-            if !local && !db.exists() {
-                bail!("cannot reach the service ({e}) and no database at {}", db.display());
-            }
-            let store = store::Store::open(&db).with_context(|| format!("opening {}", db.display()))?;
+            let db = local_db(&conn, local).map_err(|_| anyhow!("cannot reach the service ({e})"))?;
             println!("Timing password hashing on this machine…");
-            password::load_or_tune(&store, true)?
+            let dw = auth::offline(&db).await?;
+            let p = dw.retune_hashing().await.map_err(auth::cli_error)?;
+            give_back_to_service(&conn, local);
+            p.describe()
         }
     };
-    println!("Password hashing: {}.", policy.describe());
+    println!("Password hashing: {described}.");
     println!("Saved passwords switch to these settings the next time each one signs in.");
     Ok(())
 }
@@ -645,25 +660,19 @@ async fn passwd(conn: Conn, local: bool, user: &str, generate: bool) -> Result<(
     };
     let api_result = if local { Err(anyhow!("local")) } else { via_api.await };
     if let Err(e) = api_result {
+        // The service answered and refused (a too-common password, say).
+        if !local && e.downcast_ref::<client::Refused>().is_some() {
+            return Err(e);
+        }
         let paths = if local { conn.local_paths() } else { conn.paths.clone() };
         let db = paths.db_file();
         if !local && !db.exists() && !paths.data_dir.exists() {
             bail!("cannot reach the service ({e}) and no database at {}", db.display());
         }
-        let store = store::Store::open(&db).with_context(|| format!("opening {}", db.display()))?;
-        let policy = password::load_or_tune(&store, false)?;
-        let phc = password::Passwords::new(policy)?.hash(&password)?;
-        store.set_user(user, &phc)?;
-        drop(store);
-        #[cfg(unix)]
-        if service::is_root() && !local {
-            for f in ["pingrail.db", "pingrail.db-wal", "pingrail.db-shm"] {
-                let p = paths.data_dir.join(f);
-                if p.exists() {
-                    let _ = std::process::Command::new("chown").args(["pingrail:pingrail", &p.to_string_lossy()]).status();
-                }
-            }
-        }
+        let dw = auth::offline(&db).await?;
+        auth::set_password(&dw, user, &password).await.map_err(auth::cli_error)?;
+        drop(dw);
+        give_back_to_service(&conn, local);
     }
     if generate {
         println!("Web UI user: {user}\nPassword:    {password}");

@@ -1,6 +1,6 @@
 [package]
 name = "pingrail"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 rust-version = "1.88"
 description = "Multi-target ping and route monitor (PingPlotter-style) with a TUI, web UI, background service and PDF/PNG reports"
@@ -11,8 +11,13 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.104"
-argon2 = "0.6.0"
 axum = "0.8.9"
+# Signing in: passwords, passkeys, sessions and rate limits. Passkeys use
+# webauthn-rs (MPL-2.0) and OpenSSL (Apache-2.0), which is compiled in
+# ("vendored") so nothing has to be installed alongside pingrail.
+# doorward 0.1.1 (https://github.com/ulrich-za/doorward, Apache-2.0).
+doorward = { git = "https://github.com/ulrich-za/doorward", rev = "edb41f6c24afb9aa6428f3ca47eeac5128c254ee", features = ["axum", "passkeys", "vendored-openssl"] }
+doorward-sqlite = { git = "https://github.com/ulrich-za/doorward", rev = "edb41f6c24afb9aa6428f3ca47eeac5128c254ee" }
 chrono = "0.4.45"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 crossterm = "0.29.0"
@@ -47,11 +52,8 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 toml = "1.1.8"
-# Passkeys. webauthn-rs (MPL-2.0) uses OpenSSL (Apache-2.0), which is
-# compiled in ("vendored") so nothing has to be installed alongside pingrail.
-webauthn-rs = { version = "0.5.5", default-features = false, features = ["conditional-ui"] }
-openssl = { version = "0.10", features = ["vendored"] }
 tracing = "0.1.44"
+uuid = { version = "1.18", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [target."cfg(windows)".dependencies]
@@ -62,7 +64,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Networking_WinSock",
     "Win32_System_IO",
     "Win32_System_Registry",
-    "Win32_System_SystemInformation",
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",
     "Win32_UI_Shell",
