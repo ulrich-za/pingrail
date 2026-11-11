@@ -40,6 +40,10 @@ packet_size = 56
 max_hops = 30
 hop_stagger_ms = 5
 reverse_dns = true
+# Work out whose DNS this machine's lookups go through, shown as "Your DNS":
+# a few DNS questions to Akamai, Google and Team Cymru every half hour.
+# false = show only the configured servers.
+identify_dns = true
 
 [storage]
 # Samples older than this are deleted. Each share link can keep the
@@ -48,6 +52,10 @@ retention_days = 30
 # Pause destinations added by share-link visitors when free disk space drops
 # below this many MB (your own targets keep running). 0 = never.
 min_free_mb = 1024
+# How often new samples are saved to disk, in ms (100 to 10000). Raise it for
+# fewer disk writes on an SD card; graphs then run that far behind, and a
+# power cut loses up to that much.
+write_interval_ms = 250
 
 [thresholds]
 # Colouring in the TUI, web UI and reports.

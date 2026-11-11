@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::engine::Rdns;
 use crate::model::{Detail, HopReading, HopStat, LiveStatus, Overview, Target, TargetEvent, TargetOverview, Thresholds};
-use crate::stats::{bucketize, compute, timeline, Running};
+use crate::stats::{compute, timeline, Running};
 use crate::store::{HopKind, HopRecord, Sample, Store};
 
 /// What a share-link visitor is allowed to see.
@@ -113,9 +113,15 @@ pub fn overview_scoped(
     for t in store.list_targets()?.into_iter().filter(|t| scope.allows(t.id)) {
         let window_from = now - window_ms;
         let from = scope.clamp_from(window_from);
-        let rows = store.load_rounds(t.id, from, now + 1)?;
-        let stats = compute(rows.iter().map(|r| r.1));
-        let (_, buckets) = bucketize(&rows, window_from, now + 1, spark_n.clamp(1, 600));
+        // One pass, keeping no samples: a long window is millions of them.
+        let mut stats = crate::stats::Computing::default();
+        let mut spark_acc = crate::stats::Buckets::new(window_from, now + 1, spark_n.clamp(1, 600));
+        store.for_each_round(t.id, from, now + 1, |ts, rtt| {
+            stats.push(rtt);
+            spark_acc.push(ts, rtt);
+        })?;
+        let stats = stats.finish();
+        let (_, buckets) = spark_acc.finish();
         let spark = buckets.iter().map(|b| b.avg_ms).collect();
         let spark_loss = buckets
             .iter()
@@ -124,7 +130,7 @@ pub fn overview_scoped(
         let target = if scope.ids.is_some() { public_target(t) } else { t };
         out.push(TargetOverview { live: live(target.id), target, stats, spark, spark_loss });
     }
-    Ok(Overview { now_ms: now, window_ms, targets: out, thresholds })
+    Ok(Overview { now_ms: now, window_ms, targets: out, thresholds, dns: None })
 }
 
 /// Detail for one target. With `hop`, the stats and timeline describe that
@@ -166,12 +172,12 @@ pub fn detail_scoped(
     let mut acc = HopAcc::default();
     let mut hop_rows: Vec<Sample> = Vec::new();
     if target.trace {
-        store.for_each_hops(target.id, data_from, to, |ts, hs, iv| {
+        store.for_each_hops(target.id, data_from, to, hop.is_some(), |ts, hs, iv| {
             acc.push(hs);
             if let Some(ttl) = hop
                 && let Some(h) = hs.iter().find(|h| h.ttl == ttl)
             {
-                hop_rows.push((ts, h.rtt_us.map(|u| u as f64 / 1000.0), iv));
+                hop_rows.push(Sample::new(ts, h.rtt_us, iv));
             }
         })?;
     }
@@ -182,7 +188,7 @@ pub fn detail_scoped(
         Some(_) => hop_rows,
         None => store.load_samples(target.id, data_from, to)?,
     };
-    let stats = compute(rows.iter().map(|r| r.1));
+    let stats = compute(rows.iter().map(Sample::rtt_ms));
     let tl = timeline(&rows, from, to, max_points, target.interval_ms);
     let events = events(store, &target, &rows, data_from, to, scope.privacy)?;
     apply_privacy(&mut hops, scope.privacy);
@@ -215,10 +221,10 @@ fn events(store: &Store, target: &Target, rows: &[Sample], from: i64, to: i64, p
 
 /// Average round trip of the samples in `[from, to)` that got a reply.
 fn mean_rtt(rows: &[Sample], from: i64, to: i64) -> Option<f64> {
-    let start = rows.partition_point(|r| r.0 < from);
+    let start = rows.partition_point(|r| r.ts_ms < from);
     let (mut sum, mut n) = (0.0, 0u32);
-    for r in rows[start..].iter().take_while(|r| r.0 < to) {
-        if let Some(ms) = r.1 {
+    for r in rows[start..].iter().take_while(|r| r.ts_ms < to) {
+        if let Some(ms) = r.rtt_ms() {
             sum += ms;
             n += 1;
         }
@@ -285,11 +291,39 @@ pub fn hop_stats(rows: &[(i64, Vec<HopRecord>)], rdns: Option<&Arc<Rdns>>) -> Ve
     acc.finish(rdns)
 }
 
+/// How often each address answered at one hop. The same router answers
+/// sample after sample, so a run of one address is counted without hashing.
+#[derive(Default)]
+struct Responders {
+    counts: HashMap<IpAddr, u32>,
+    run: Option<(IpAddr, u32)>,
+}
+
+impl Responders {
+    fn push(&mut self, ip: IpAddr) {
+        match &mut self.run {
+            Some((last, n)) if *last == ip => *n += 1,
+            run => {
+                if let Some((last, n)) = run.replace((ip, 1)) {
+                    *self.counts.entry(last).or_default() += n;
+                }
+            }
+        }
+    }
+
+    fn finish(mut self) -> HashMap<IpAddr, u32> {
+        if let Some((last, n)) = self.run.take() {
+            *self.counts.entry(last).or_default() += n;
+        }
+        self.counts
+    }
+}
+
 /// Per-hop statistics built up one sample at a time, without keeping the
 /// samples (a month of a traced target is millions of hop replies).
 #[derive(Default)]
 pub struct HopAcc {
-    by_ttl: Vec<(Running, HashMap<IpAddr, u32>)>,
+    by_ttl: Vec<(Running, Responders)>,
     /// Destination TTL of the last 20 samples (None = not reached).
     recent_dest: std::collections::VecDeque<Option<u8>>,
     max_probed: u8,
@@ -319,7 +353,7 @@ impl HopAcc {
             let (run, addrs) = &mut self.by_ttl[i];
             run.push(h.rtt_us.map(|u| u as f64 / 1000.0));
             if let Some(ip) = h.addr {
-                *addrs.entry(ip).or_default() += 1;
+                addrs.push(ip);
                 self.furthest = self.furthest.max(h.ttl);
             }
         }
@@ -345,6 +379,7 @@ impl HopAcc {
             .enumerate()
             .map(|(i, (run, addrs))| {
                 let ttl = (i + 1) as u8;
+                let addrs = addrs.finish();
                 let top = addrs.iter().max_by_key(|(_, n)| **n).map(|(ip, _)| *ip);
                 HopStat {
                     ttl,
@@ -366,6 +401,18 @@ impl HopAcc {
 mod tests {
     use super::*;
     use crate::model::Stats;
+
+    #[test]
+    fn responders_are_counted_whether_or_not_they_take_turns() {
+        let ip = |n: u8| IpAddr::from([10, 0, 0, n]);
+        let mut r = Responders::default();
+        for n in [1, 1, 1, 2, 1, 2, 2, 3, 1, 1] {
+            r.push(ip(n));
+        }
+        let counts = r.finish();
+        assert_eq!((counts[&ip(1)], counts[&ip(2)], counts[&ip(3)]), (6, 3, 1));
+        assert!(Responders::default().finish().is_empty());
+    }
 
     #[test]
     fn address_changes_come_with_latency_before_and_after() {

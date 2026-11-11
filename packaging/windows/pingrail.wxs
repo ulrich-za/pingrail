@@ -13,7 +13,7 @@
   removed first, and on first start pingrail imports its history, password,
   share links and settings from C:\ProgramData\hopwatch (left in place).
 
-  Build:  wixl -a x64 -D Version=0.3.2 -D SourceDir=<staging dir> -o pingrail.msi pingrail.wxs
+  Build:  wixl -a x64 -D Version=0.3.3 -D SourceDir=<staging dir> -o pingrail.msi pingrail.wxs
   The staging dir holds pingrail.exe, pingrail.ico, README.md, LICENSE,
   THIRD-PARTY-NOTICES.txt, pingrail.toml.example and fonts/.
 -->

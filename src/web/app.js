@@ -1277,7 +1277,10 @@ async function refresh() {
   try {
     // The target list changes slowly: fetch it every few seconds even when
     // the selected graph refreshes every second.
-    if (!S.overview || S.overview.window_ms !== S.windowMs || Date.now() - S.ovAt > 4000) {
+    if (!S.overview || S.listStale || S.overview.window_ms !== S.windowMs || Date.now() - S.ovAt > 4000) {
+      // Cleared before asking: a change made while the answer is on its way
+      // sets it again, and the list is fetched once more.
+      S.listStale = false;
       let ov;
       /*@admin*/
       ov = await api(`/api/overview?window_ms=${S.windowMs}&spark=40`);
@@ -1336,6 +1339,13 @@ function detailPath(id) {
 
 function refreshSoon() {
   schedule(0);
+}
+
+/** A target was added, removed or changed: fetch the list again now rather
+ *  than when it is next due. */
+function listChanged() {
+  S.listStale = true;
+  refreshSoon();
 }
 
 function setConn(state, msg) {
@@ -1517,6 +1527,18 @@ function renderDetail() {
   /*@end*/
   /*@end*/
   $('#t-meta').textContent = parts.join(', ');
+  // Whose DNS turns names into addresses here. "Your" is the owner's word:
+  // a share link's reader is someone else.
+  const dns = S.overview.dns;
+  let dnsLabel;
+  /*@admin*/
+  dnsLabel = 'Your DNS';
+  /*@end*/
+  /*@share*/
+  dnsLabel = 'This monitor’s DNS';
+  /*@end*/
+  $('#t-dns').hidden = !dns?.text;
+  $('#t-dns').textContent = dns?.text ? `${dnsLabel}: ${dns.text}` : '';
   /*@add*/
   $('#t-pause').textContent = t.enabled ? 'Pause' : 'Resume';
   /*@end*/
@@ -2029,7 +2051,9 @@ function drawLatency(d) {
     g.fillStyle = ink3;
     g.textAlign = 'center';
     g.textBaseline = 'middle';
-    g.fillText(pts.length ? 'No replies in this period' : 'No samples in this period', PAD.l + pw / 2, top + ph / 2);
+    const t = selectedOverview()?.target;
+    const fresh = !pts.length && t && t.enabled && S.viewEnd === null && Date.now() - t.created_ms < 60000;
+    g.fillText(pts.length ? 'No replies in this period' : fresh ? 'Waiting for the first sample' : 'No samples in this period', PAD.l + pw / 2, top + ph / 2);
   }
 
   // Hover
@@ -2508,7 +2532,7 @@ async function onTargetSave(ev) {
     $('#target-dialog').close();
     S.selected = t.id;
     S.detail = null;
-    refreshSoon();
+    listChanged();
   } catch (e) {
     $('#target-error').textContent = e.message ? cap(e.message) : 'Could not save the target.';
   } finally {
@@ -2548,7 +2572,8 @@ async function quickAdd(host, name) {
     const t = await api(targetPath(), { json: { host, name, trace: true } });
     toast(`Added ${t.name}`);
     S.selected = t.id;
-    refreshSoon();
+    S.detail = null;
+    listChanged();
   } catch (e) {
     toast(e.message);
   }
@@ -2561,7 +2586,7 @@ async function patchSelected(patch, msg) {
   try {
     await api(targetPath(ov.target.id), { method: 'PATCH', json: patch });
     toast(msg(ov.target));
-    refreshSoon();
+    listChanged();
   } catch (e) {
     toast(e.message);
   }
@@ -2583,8 +2608,14 @@ function openRemove() {
       applyVisit();
       /*@end*/
       toast(`Removed ${ov.target.name}`);
-      S.selected = null;
-      refreshSoon();
+      // Off the page at once; the next list confirms it.
+      if (S.overview) S.overview.targets = S.overview.targets.filter((x) => x.target.id !== ov.target.id);
+      S.selected = S.overview?.targets[0]?.target.id ?? null;
+      S.detail = null;
+      S.hop = null;
+      renderList();
+      renderDetail();
+      listChanged();
     } catch (e) {
       toast(e.message);
     }

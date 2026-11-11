@@ -144,10 +144,10 @@ pub fn router(state: St) -> Router {
         .route("/api/me", get(me))
         .route("/api/password", post(set_password))
         .route("/api/password/tune", post(tune_passwords))
-        .route("/api/overview", get(overview))
+        .route("/api/overview", get(overview).layer(middleware::from_fn(crate::http::gzip_json)))
         .route("/api/targets", get(list_targets).post(add_target))
         .route("/api/targets/{id}", axum::routing::patch(patch_target).delete(delete_target))
-        .route("/api/targets/{id}/detail", get(detail))
+        .route("/api/targets/{id}/detail", get(detail).layer(middleware::from_fn(crate::http::gzip_json)))
         .route("/api/report", get(report_handler))
         .route("/api/sessions", post(open_session))
         .route("/api/sessions/{id}/heartbeat", post(heartbeat))
@@ -198,7 +198,7 @@ pub fn static_routes() -> Router<St> {
         Visitor { add: false, export: true },
         Visitor { add: true, export: true },
     ] {
-        r = r.route(v.script_path(), get(move || async move { asset(crate::pages::pages().share_js(v), "text/javascript; charset=utf-8") }));
+        r = r.route(v.script_path(), get(move |h: HeaderMap| async move { asset(&h, crate::pages::pages().share_js(v), "text/javascript; charset=utf-8") }));
     }
     r
 }
@@ -440,16 +440,8 @@ pub mod about {
         https://github.com/ulrich-za/pingrail.";
 }
 
-fn asset(body: &'static str, ctype: &'static str) -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, ctype),
-            (header::CACHE_CONTROL, "no-cache"),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-        ],
-        body,
-    )
-        .into_response()
+fn asset(req: &HeaderMap, body: &'static str, ctype: &'static str) -> Response {
+    crate::http::packed(body).response(req, ctype, true)
 }
 
 fn font(body: &'static [u8]) -> Response {
@@ -457,8 +449,8 @@ fn font(body: &'static [u8]) -> Response {
 }
 
 /// The admin UI.
-pub async fn index() -> Response {
-    asset(&crate::pages::pages().admin_html, "text/html; charset=utf-8")
+pub async fn index(h: HeaderMap) -> Response {
+    asset(&h, &crate::pages::pages().admin_html, "text/html; charset=utf-8")
 }
 pub async fn favicon_ico() -> Response {
     ([(header::CONTENT_TYPE, "image/x-icon"), (header::CACHE_CONTROL, "max-age=86400")], FAVICON_ICO).into_response()
@@ -466,20 +458,20 @@ pub async fn favicon_ico() -> Response {
 pub async fn touch_icon() -> Response {
     ([(header::CONTENT_TYPE, "image/png"), (header::CACHE_CONTROL, "max-age=86400")], TOUCH_ICON).into_response()
 }
-pub async fn license_txt() -> Response {
-    asset(LICENSE_TEXT, "text/plain; charset=utf-8")
+pub async fn license_txt(h: HeaderMap) -> Response {
+    asset(&h, LICENSE_TEXT, "text/plain; charset=utf-8")
 }
-pub async fn third_party_txt() -> Response {
-    asset(THIRD_PARTY_TEXT, "text/plain; charset=utf-8")
+pub async fn third_party_txt(h: HeaderMap) -> Response {
+    asset(&h, THIRD_PARTY_TEXT, "text/plain; charset=utf-8")
 }
-pub async fn app_js() -> Response {
-    asset(&crate::pages::pages().admin_js, "text/javascript; charset=utf-8")
+pub async fn app_js(h: HeaderMap) -> Response {
+    asset(&h, &crate::pages::pages().admin_js, "text/javascript; charset=utf-8")
 }
-pub async fn app_css() -> Response {
-    asset(APP_CSS, "text/css; charset=utf-8")
+pub async fn app_css(h: HeaderMap) -> Response {
+    asset(&h, APP_CSS, "text/css; charset=utf-8")
 }
-pub async fn favicon() -> Response {
-    asset(FAVICON, "image/svg+xml")
+pub async fn favicon(h: HeaderMap) -> Response {
+    asset(&h, FAVICON, "image/svg+xml")
 }
 
 // ----- handlers -----------------------------------------------------------
@@ -718,10 +710,11 @@ async fn overview(State(st): State<St>, Query(q): Query<OverviewQuery>) -> ApiRe
     let spark = q.spark.unwrap_or(30);
     let engine = st.engine.clone();
     let thresholds = st.cfg.thresholds;
-    let ov = blocking(&st.store, move |s| {
+    let mut ov = blocking(&st.store, move |s| {
         analysis::overview(s, &|id| engine.live(id), thresholds, now_ms(), window, spark)
     })
     .await?;
+    ov.dns = st.engine.dns.view();
     Ok(Json(ov))
 }
 
@@ -778,6 +771,7 @@ async fn patch_target(
 async fn delete_target(State(st): State<St>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
     let ok = blocking(&st.store, move |s| s.delete_target(id)).await?;
     st.engine.sync().await?;
+    crate::store::purge_soon(&st.store);
     if ok { Ok(StatusCode::NO_CONTENT) } else { Err(ApiError::not_found()) }
 }
 

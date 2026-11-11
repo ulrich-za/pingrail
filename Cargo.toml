@@ -1,8 +1,8 @@
 [package]
 name = "pingrail"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Multi-target ping and route monitor (PingPlotter-style) with a TUI, web UI, background service and PDF/PNG reports"
 authors = ["Ulrich Holtzhausen <98807810+ulrich-za@users.noreply.github.com>"]
 license = "Apache-2.0"
@@ -28,6 +28,7 @@ hex = "0.4.3"
 hyper = { version = "1.12", features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["server", "http1", "tokio", "service", "server-graceful"] }
 libc = "0.2.191"
+flate2 = "1.1"
 pdf-writer = "0.12"
 qrcode = { version = "0.14.1", default-features = false }
 ratatui = "0.30.2"
@@ -43,7 +44,7 @@ x509-parser = "0.18"
 ring = "0.17"
 rustls-platform-verifier = "0.7"
 resvg = "0.45"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 socket2 = { version = "0.6.5", features = ["all"] }
@@ -61,6 +62,7 @@ windows-service = "0.8.1"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     "Win32_System_IO",
     "Win32_System_Registry",

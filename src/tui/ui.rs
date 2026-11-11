@@ -327,7 +327,10 @@ fn draw_hops(f: &mut Frame, area: Rect, app: &mut App) {
         }
         _ => {}
     }
-    let b = block(Line::from(title), focused);
+    let mut b = block(Line::from(title), focused);
+    if let Some(dns) = app.overview.as_ref().and_then(|o| o.dns.as_ref()).filter(|d| !d.text.is_empty()) {
+        b = b.title_bottom(Line::from(Span::styled(format!(" Your DNS: {} ", dns.text), Style::new().fg(Color::Gray))));
+    }
     if d.hops.is_empty() {
         let inner = b.inner(area);
         f.render_widget(b, area);

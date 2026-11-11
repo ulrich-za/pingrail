@@ -129,6 +129,9 @@ pub struct Overview {
     pub window_ms: i64,
     pub targets: Vec<TargetOverview>,
     pub thresholds: Thresholds,
+    /// The DNS the monitor's lookups go through (see `dns`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<crate::dns::DnsView>,
 }
 
 /// Statistics for one hop of the route.

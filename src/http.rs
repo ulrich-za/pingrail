@@ -6,7 +6,7 @@
 //! https:// address and the connection is closed.
 
 use axum::extract::{ConnectInfo, Request};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Router;
@@ -283,5 +283,159 @@ mod tests {
         assert!(in_nets("10.9.200.1".parse().unwrap(), &nets));
         assert!(!in_nets("192.168.1.10".parse().unwrap(), &nets));
         assert!(!in_nets("127.0.0.2".parse().unwrap(), &nets));
+    }
+}
+
+/// Whether the browser takes gzip (`Accept-Encoding`, honouring `q=0`).
+pub fn takes_gzip(h: &HeaderMap) -> bool {
+    h.get_all(header::ACCEPT_ENCODING).iter().filter_map(|v| v.to_str().ok()).flat_map(|v| v.split(',')).any(|part| {
+        let mut it = part.split(';');
+        let name = it.next().unwrap_or("").trim();
+        let off = it.any(|p| {
+            let p = p.trim();
+            p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")).is_some_and(|q| q.parse::<f32>().is_ok_and(|q| q == 0.0))
+        });
+        name.eq_ignore_ascii_case("gzip") && !off
+    })
+}
+
+fn gzip_bytes(data: &[u8], level: flate2::Compression) -> Vec<u8> {
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(data.len() / 4 + 64), level);
+    // Writing to a Vec can't fail.
+    let _ = enc.write_all(data);
+    enc.finish().unwrap_or_default()
+}
+
+/// A page, script or stylesheet kept ready in plain and gzip form, with a
+/// tag of its contents so a browser that already has it is told so (304)
+/// instead of being sent it again.
+pub struct Packed {
+    raw: &'static str,
+    gz: &'static [u8],
+    etag: HeaderValue,
+}
+
+/// The packed form of a built-in text file, made on first use. Only ever
+/// called with the handful of files built into the program.
+pub fn packed(body: &'static str) -> &'static Packed {
+    static ALL: Mutex<Vec<&'static Packed>> = Mutex::new(Vec::new());
+    let mut all = ALL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = all.iter().find(|p| std::ptr::eq(p.raw, body)) {
+        return p;
+    }
+    let digest = ring::digest::digest(&ring::digest::SHA256, body.as_bytes());
+    let tag: String = digest.as_ref()[..8].iter().map(|b| format!("{b:02x}")).collect();
+    let p: &'static Packed = Box::leak(Box::new(Packed {
+        raw: body,
+        gz: Box::leak(gzip_bytes(body.as_bytes(), flate2::Compression::best()).into_boxed_slice()),
+        etag: HeaderValue::from_str(&format!("\"{tag}\"")).unwrap_or(HeaderValue::from_static("\"0\"")),
+    }));
+    all.push(p);
+    p
+}
+
+impl Packed {
+    /// The response for a request with these headers. `revalidate` is for
+    /// files a browser may keep and check (scripts, styles); pages that must
+    /// be fetched every time pass false.
+    pub fn response(&self, req: &HeaderMap, ctype: &'static str, revalidate: bool) -> Response {
+        let mut h = HeaderMap::new();
+        h.insert(header::CONTENT_TYPE, HeaderValue::from_static(ctype));
+        h.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static(if revalidate { "no-cache" } else { "no-store" }));
+        if revalidate {
+            h.insert(header::ETAG, self.etag.clone());
+            let have = req.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()).unwrap_or("");
+            let tag = self.etag.to_str().unwrap_or("");
+            if have.split(',').any(|t| t.trim().trim_start_matches("W/") == tag) {
+                return (StatusCode::NOT_MODIFIED, h).into_response();
+            }
+        }
+        if takes_gzip(req) && self.gz.len() < self.raw.len() {
+            h.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            (h, self.gz).into_response()
+        } else {
+            (h, self.raw).into_response()
+        }
+    }
+}
+
+/// gzip for the large JSON answers (overview and detail), which a browser
+/// with the page open fetches every second or so. Those carry measurements
+/// only, never a token or session secret, so compressing them gives nothing
+/// away through their size. Sign-in and settings answers are not compressed.
+pub async fn gzip_json(req: Request, next: Next) -> Response {
+    let wants = takes_gzip(req.headers());
+    let resp = next.run(req).await;
+    if !wants || resp.status() != StatusCode::OK || resp.headers().contains_key(header::CONTENT_ENCODING) {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, 256 * 1024 * 1024).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    parts.headers.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
+    if bytes.len() < 1024 {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    }
+    let gz = gzip_bytes(&bytes, flate2::Compression::fast());
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+    Response::from_parts(parts, axum::body::Body::from(gz))
+}
+
+#[cfg(test)]
+mod pack_tests {
+    use super::*;
+    use std::io::Read;
+
+    fn headers(pairs: &[(header::HeaderName, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(k.clone(), HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn gzip_only_when_the_browser_takes_it() {
+        assert!(takes_gzip(&headers(&[(header::ACCEPT_ENCODING, "gzip, deflate, br")])));
+        assert!(takes_gzip(&headers(&[(header::ACCEPT_ENCODING, "br;q=1.0, GZIP;q=0.5")])));
+        assert!(!takes_gzip(&headers(&[(header::ACCEPT_ENCODING, "gzip;q=0, br")])));
+        assert!(!takes_gzip(&headers(&[(header::ACCEPT_ENCODING, "br, identity")])));
+        assert!(!takes_gzip(&HeaderMap::new()));
+    }
+
+    #[tokio::test]
+    async fn packed_file_round_trips_and_answers_not_modified() {
+        static BODY: &str = "body { color: red; } /* padding padding padding padding padding padding padding padding */";
+        let p = packed(BODY);
+        assert!(std::ptr::eq(p, packed(BODY)), "made once");
+
+        let plain = p.response(&HeaderMap::new(), "text/css", true);
+        assert!(plain.headers().get(header::CONTENT_ENCODING).is_none());
+        let etag = plain.headers().get(header::ETAG).unwrap().to_str().unwrap().to_string();
+        let body = axum::body::to_bytes(plain.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(body, BODY.as_bytes());
+
+        let gz = p.response(&headers(&[(header::ACCEPT_ENCODING, "gzip")]), "text/css", true);
+        assert_eq!(gz.headers().get(header::CONTENT_ENCODING).unwrap(), "gzip");
+        assert_eq!(gz.headers().get(header::VARY).unwrap(), "accept-encoding");
+        let body = axum::body::to_bytes(gz.into_body(), 1 << 20).await.unwrap();
+        let mut out = String::new();
+        flate2::read::GzDecoder::new(&body[..]).read_to_string(&mut out).unwrap();
+        assert_eq!(out, BODY);
+
+        let same = p.response(&headers(&[(header::IF_NONE_MATCH, &etag)]), "text/css", true);
+        assert_eq!(same.status(), StatusCode::NOT_MODIFIED);
+        let other = p.response(&headers(&[(header::IF_NONE_MATCH, "\"nope\"")]), "text/css", true);
+        assert_eq!(other.status(), StatusCode::OK);
+
+        // A page that must be fetched every time carries no tag to check.
+        let page = p.response(&headers(&[(header::IF_NONE_MATCH, &etag)]), "text/html", false);
+        assert_eq!(page.status(), StatusCode::OK);
+        assert!(page.headers().get(header::ETAG).is_none());
+        assert_eq!(page.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
     }
 }

@@ -99,6 +99,10 @@ pub struct ProbeConfig {
     pub hop_stagger_ms: u32,
     /// Look up hostnames for hop addresses.
     pub reverse_dns: bool,
+    /// Work out whose DNS this machine's lookups go through ("Your DNS"),
+    /// with a few DNS questions to Akamai, Google and Team Cymru every half
+    /// hour. Off = only the configured servers are shown.
+    pub identify_dns: bool,
 }
 
 impl Default for ProbeConfig {
@@ -110,6 +114,7 @@ impl Default for ProbeConfig {
             max_hops: 30,
             hop_stagger_ms: 5,
             reverse_dns: true,
+            identify_dns: true,
         }
     }
 }
@@ -122,11 +127,21 @@ pub struct StorageConfig {
     /// When free disk space drops below this, destinations added by share-link
     /// visitors are paused (your own targets keep running). 0 = never.
     pub min_free_mb: u64,
+    /// How often new samples are saved to disk (ms, 100 to 10000). Longer
+    /// means fewer disk writes (kinder to an SD card) but graphs run that
+    /// far behind, and a power cut loses up to that much.
+    pub write_interval_ms: u32,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
-        Self { retention_days: 30, min_free_mb: 1024 }
+        Self { retention_days: 30, min_free_mb: 1024, write_interval_ms: 250 }
+    }
+}
+
+impl StorageConfig {
+    pub fn write_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.write_interval_ms.clamp(100, 10_000) as u64)
     }
 }
 

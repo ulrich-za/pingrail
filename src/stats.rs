@@ -6,60 +6,39 @@ use crate::store::Sample;
 /// Compute statistics over samples in time order. `None` is a lost sample;
 /// `Some(ms)` is a reply with that round-trip time.
 pub fn compute<I: IntoIterator<Item = Option<f64>>>(samples: I) -> Stats {
-    let mut sent = 0u32;
-    let mut received = 0u32;
-    let mut min = f64::INFINITY;
-    let mut max = f64::NEG_INFINITY;
-    let mut sum = 0.0;
-    let mut sumsq = 0.0;
-    let mut prev: Option<f64> = None;
-    let mut jitter_sum = 0.0;
-    let mut jitter_n = 0u32;
-    let mut last: Option<Option<f64>> = None;
-    let mut values = Vec::new();
-
+    let mut c = Computing::default();
     for s in samples {
-        sent += 1;
-        last = Some(s);
+        c.push(s);
+    }
+    c.finish()
+}
+
+/// [`compute`], one sample at a time. Keeps 4 bytes per reply (for the 95th
+/// percentile) and nothing else.
+#[derive(Default)]
+pub struct Computing {
+    run: Running,
+    /// Replies in whole microseconds, which is how they are measured.
+    values: Vec<u32>,
+}
+
+impl Computing {
+    pub fn push(&mut self, s: Option<f64>) {
+        self.run.push(s);
         if let Some(v) = s {
-            received += 1;
-            min = min.min(v);
-            max = max.max(v);
-            sum += v;
-            sumsq += v * v;
-            if let Some(p) = prev {
-                jitter_sum += (v - p).abs();
-                jitter_n += 1;
-            }
-            prev = Some(v);
-            values.push(v);
+            self.values.push((v * 1000.0).round().clamp(0.0, u32::MAX as f64) as u32);
         }
     }
 
-    if sent == 0 {
-        return Stats::default();
-    }
-    let loss_pct = 100.0 * (sent - received) as f64 / sent as f64;
-    if received == 0 {
-        return Stats { sent, received, loss_pct, ..Stats::default() };
-    }
-    let n = received as f64;
-    let avg = sum / n;
-    let var = (sumsq / n - avg * avg).max(0.0);
-    let jitter = if jitter_n > 0 { Some(jitter_sum / jitter_n as f64) } else { Some(0.0) };
-    let p95 = percentile(&mut values, 95.0);
-    Stats {
-        sent,
-        received,
-        loss_pct,
-        cur_ms: last.flatten(),
-        min_ms: Some(min),
-        avg_ms: Some(avg),
-        max_ms: Some(max),
-        stddev_ms: Some(var.sqrt()),
-        jitter_ms: jitter,
-        p95_ms: p95,
-        mos: Some(mos(avg, jitter.unwrap_or(0.0), loss_pct)),
+    pub fn finish(mut self) -> Stats {
+        let mut stats = self.run.finish();
+        if !self.values.is_empty() {
+            let rank = (0.95 * self.values.len() as f64).ceil() as usize;
+            let idx = rank.clamp(1, self.values.len()) - 1;
+            let (_, v, _) = self.values.select_nth_unstable(idx);
+            stats.p95_ms = Some(*v as f64 / 1000.0);
+        }
+        stats
     }
 }
 
@@ -170,37 +149,60 @@ pub fn mos(avg_ms: f64, jitter_ms: f64, loss_pct: f64) -> f64 {
 
 /// Split `[from, to)` into `n` equal buckets and aggregate samples into them.
 /// `rows` must be sorted by timestamp; each is `(ts_ms, rtt_ms)`.
+#[cfg(test)]
 pub fn bucketize(rows: &[(i64, Option<f64>)], from: i64, to: i64, n: usize) -> (i64, Vec<Bucket>) {
-    let n = n.max(1);
-    let span = (to - from).max(1);
-    let width = ((span as f64) / n as f64).ceil().max(1.0) as i64;
-    let mut buckets: Vec<Bucket> = (0..n)
-        .map(|i| Bucket { t_ms: from + i as i64 * width, ..Bucket::default() })
-        .collect();
-    let mut sums = vec![0.0f64; n];
+    let mut b = Buckets::new(from, to, n);
     for &(ts, rtt) in rows {
-        if ts < from || ts >= to {
-            continue;
+        b.push(ts, rtt);
+    }
+    b.finish()
+}
+
+/// `[from, to)` split into `n` equal buckets, filled one sample at a time.
+pub struct Buckets {
+    from: i64,
+    to: i64,
+    width: i64,
+    buckets: Vec<Bucket>,
+    sums: Vec<f64>,
+}
+
+impl Buckets {
+    pub fn new(from: i64, to: i64, n: usize) -> Buckets {
+        let n = n.max(1);
+        let span = (to - from).max(1);
+        let width = ((span as f64) / n as f64).ceil().max(1.0) as i64;
+        let buckets = (0..n).map(|i| Bucket { t_ms: from + i as i64 * width, ..Bucket::default() }).collect();
+        Buckets { from, to, width, buckets, sums: vec![0.0; n] }
+    }
+
+    pub fn push(&mut self, ts: i64, rtt: Option<f64>) {
+        if ts < self.from || ts >= self.to {
+            return;
         }
-        let idx = (((ts - from) / width) as usize).min(n - 1);
-        let b = &mut buckets[idx];
+        let idx = (((ts - self.from) / self.width) as usize).min(self.buckets.len() - 1);
+        let b = &mut self.buckets[idx];
         b.sent += 1;
         match rtt {
             None => b.lost += 1,
             Some(v) => {
-                sums[idx] += v;
+                self.sums[idx] += v;
                 b.min_ms = Some(b.min_ms.map_or(v, |m| m.min(v)));
                 b.max_ms = Some(b.max_ms.map_or(v, |m| m.max(v)));
             }
         }
     }
-    for (b, s) in buckets.iter_mut().zip(sums) {
-        let got = b.sent - b.lost;
-        if got > 0 {
-            b.avg_ms = Some(s / got as f64);
+
+    /// The bucket width and the buckets.
+    pub fn finish(mut self) -> (i64, Vec<Bucket>) {
+        for (b, s) in self.buckets.iter_mut().zip(self.sums) {
+            let got = b.sent - b.lost;
+            if got > 0 {
+                b.avg_ms = Some(s / got as f64);
+            }
         }
+        (self.width, self.buckets)
     }
-    (width, buckets)
 }
 
 /// Slice lengths the timeline may use, so neighbouring views and visitors
@@ -227,17 +229,37 @@ const TAIL_SLACK_MS: i64 = 3_500;
 /// missing data.
 pub fn timeline(samples: &[Sample], from: i64, to: i64, max_points: usize, default_iv: u32) -> Timeline {
     let max_points = max_points.clamp(10, 4000);
-    let iv_of = |s: &Sample| s.2.unwrap_or(default_iv).max(1) as i64;
+    let iv_of = |s: &Sample| s.interval_ms().unwrap_or(default_iv).max(1) as i64;
     let (typical, iv_min, iv_max) = {
-        let mut ivs: Vec<i64> = samples.iter().map(iv_of).collect();
-        if ivs.is_empty() {
-            let d = default_iv.max(1) as i64;
-            (d, d, d)
-        } else {
-            let lo = *ivs.iter().min().unwrap();
-            let hi = *ivs.iter().max().unwrap();
-            let mid = ivs.len() / 2;
-            (*ivs.select_nth_unstable(mid).1, lo, hi)
+        // The median interval, by counting how many samples used each (a
+        // target has a handful of intervals over its life, not millions).
+        let mut counts: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+        let mut run: Option<(i64, usize)> = None;
+        for s in samples {
+            let iv = iv_of(s);
+            match &mut run {
+                Some((last, n)) if *last == iv => *n += 1,
+                run => {
+                    if let Some((last, n)) = run.replace((iv, 1)) {
+                        *counts.entry(last).or_default() += n;
+                    }
+                }
+            }
+        }
+        if let Some((last, n)) = run {
+            *counts.entry(last).or_default() += n;
+        }
+        match (counts.keys().next(), counts.keys().next_back()) {
+            (Some(lo), Some(hi)) => {
+                let mid = samples.len() / 2;
+                let mut seen = 0;
+                let median = counts.iter().find(|(_, n)| { seen += **n; seen > mid }).map_or(*hi, |(iv, _)| *iv);
+                (median, *lo, *hi)
+            }
+            _ => {
+                let d = default_iv.max(1) as i64;
+                (d, d, d)
+            }
         }
     };
 
@@ -246,33 +268,28 @@ pub fn timeline(samples: &[Sample], from: i64, to: i64, max_points: usize, defau
     let mut gap_before = vec![false; samples.len()];
     match (samples.first(), samples.last()) {
         (Some(first), Some(last)) => {
-            if (first.0 - from) as f64 > GAP_INTERVALS * iv_of(first) as f64 {
-                gaps.push([from, first.0]);
+            if (first.ts_ms - from) as f64 > GAP_INTERVALS * iv_of(first) as f64 {
+                gaps.push([from, first.ts_ms]);
             }
             for i in 1..samples.len() {
                 let (a, b) = (&samples[i - 1], &samples[i]);
                 let allowed = GAP_INTERVALS * iv_of(a).max(iv_of(b)) as f64;
-                if (b.0 - a.0) as f64 > allowed {
-                    gaps.push([a.0 + iv_of(a), b.0]);
+                if (b.ts_ms - a.ts_ms) as f64 > allowed {
+                    gaps.push([a.ts_ms + iv_of(a), b.ts_ms]);
                     gap_before[i] = true;
                 }
             }
             let iv = iv_of(last);
-            if ((to - last.0) as f64) > GAP_INTERVALS * iv as f64 + TAIL_SLACK_MS as f64 {
-                gaps.push([last.0 + iv, to]);
+            if ((to - last.ts_ms) as f64) > GAP_INTERVALS * iv as f64 + TAIL_SLACK_MS as f64 {
+                gaps.push([last.ts_ms + iv, to]);
             }
         }
         _ => gaps.push([from, to]),
     }
 
-    let point = |s: &Sample, gap: bool| Point {
-        t_ms: s.0,
-        sent: 1,
-        lost: s.1.is_none() as u32,
-        min_ms: s.1,
-        avg_ms: s.1,
-        max_ms: s.1,
-        gap,
+    let point = |s: &Sample, gap: bool| {
+        let rtt = s.rtt_ms();
+        Point { t_ms: s.ts_ms, sent: 1, lost: rtt.is_none() as u32, min_ms: rtt, avg_ms: rtt, max_ms: rtt, gap }
     };
     if samples.len() <= max_points {
         return Timeline {
@@ -300,7 +317,7 @@ pub fn timeline(samples: &[Sample], from: i64, to: i64, max_points: usize, defau
     let mut points: Vec<Point> = Vec::new();
     let mut sums: Vec<f64> = Vec::new();
     for (s, gap) in samples.iter().zip(&gap_before) {
-        let start = s.0.div_euclid(step) * step;
+        let start = s.ts_ms.div_euclid(step) * step;
         if points.last().is_none_or(|p| p.t_ms != start) {
             points.push(Point { t_ms: start, gap: *gap, ..Point::default() });
             sums.push(0.0);
@@ -308,7 +325,7 @@ pub fn timeline(samples: &[Sample], from: i64, to: i64, max_points: usize, defau
         let p = points.last_mut().expect("just pushed");
         let sum = sums.last_mut().expect("just pushed");
         p.sent += 1;
-        match s.1 {
+        match s.rtt_ms() {
             None => p.lost += 1,
             Some(v) => {
                 *sum += v;
@@ -390,6 +407,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn streaming_statistics_match_keeping_every_sample() {
+        // A spread of round trips with some lost, as (ms, in microsecond steps).
+        let samples: Vec<Option<f64>> =
+            (0..5000u32).map(|i| (i % 37 != 0).then(|| ((i * 7919) % 90_000) as f64 / 1000.0 + 0.25)).collect();
+        let s = compute(samples.iter().copied());
+        let mut kept: Vec<f64> = samples.iter().flatten().copied().collect();
+        assert_eq!(s.p95_ms, percentile(&mut kept, 95.0), "the 95th percentile, exactly");
+        assert_eq!(s.sent, 5000);
+        assert_eq!(s.received as usize, kept.len());
+        let avg = kept.iter().sum::<f64>() / kept.len() as f64;
+        assert!((s.avg_ms.unwrap() - avg).abs() < 1e-9);
+        assert_eq!(compute(std::iter::empty()), Stats::default());
+        assert_eq!(compute([None, None]).p95_ms, None);
+    }
+
+    #[test]
+    fn typical_interval_is_the_median_without_listing_them() {
+        // 30 samples at 1 s, then 50 at 2.5 s, then 5 at 60 s.
+        let mut s: Vec<Sample> = (0..30).map(|i| Sample::from_ms(i * 1000, Some(1.0), Some(1000))).collect();
+        s.extend((0..50).map(|i| Sample::from_ms(30_000 + i * 2500, Some(1.0), Some(2500))));
+        s.extend((0..5).map(|i| Sample::from_ms(155_000 + i * 60_000, Some(1.0), Some(60_000))));
+        let tl = timeline(&s, 0, 460_000, 4000, 1000);
+        assert_eq!((tl.interval_ms, tl.interval_min_ms, tl.interval_max_ms), (2500, 1000, 60_000));
+        // Samples saved before intervals were use the target's own.
+        let old: Vec<Sample> = (0..10).map(|i| Sample::from_ms(i * 5000, Some(1.0), None)).collect();
+        assert_eq!(timeline(&old, 0, 50_000, 4000, 5000).interval_ms, 5000);
+    }
+
+    #[test]
     fn basic_stats() {
         let s = compute([Some(10.0), Some(20.0), None, Some(30.0)]);
         assert_eq!(s.sent, 4);
@@ -442,7 +488,7 @@ mod tests {
     }
 
     fn samples(n: usize, step: i64, iv: u32) -> Vec<Sample> {
-        (0..n).map(|i| (i as i64 * step, Some(1.0 + (i % 7) as f64), Some(iv))).collect()
+        (0..n).map(|i| Sample::from_ms(i as i64 * step, Some(1.0 + (i % 7) as f64), Some(iv))).collect()
     }
 
     #[test]
@@ -487,7 +533,7 @@ mod tests {
         // 2.5 s samples, then a 60 s pause, then more samples.
         let mut s = samples(40, 2500, 2500);
         let resume = 40 * 2500 + 60_000;
-        s.extend((0..40).map(|i| (resume + i * 2500, Some(1.0), Some(2500))));
+        s.extend((0..40).map(|i| Sample::from_ms(resume + i * 2500, Some(1.0), Some(2500))));
         let t = timeline(&s, 0, resume + 40 * 2500, 700, 2500);
         assert_eq!(t.gaps.len(), 1);
         assert_eq!(t.points.iter().filter(|p| p.gap).count(), 1);
@@ -499,7 +545,7 @@ mod tests {
         // A visitor switches a destination from 1 s to 60 s.
         let mut s = samples(120, 1000, 1000);
         let start = 120 * 1000;
-        s.extend((0..10).map(|i| (start + i * 60_000, Some(5.0), Some(60_000))));
+        s.extend((0..10).map(|i| Sample::from_ms(start + i * 60_000, Some(5.0), Some(60_000))));
         let t = timeline(&s, 0, start + 10 * 60_000, 700, 1000);
         assert!(t.gaps.is_empty(), "{:?}", t.gaps);
         assert!(t.points.iter().all(|p| !p.gap));
@@ -508,7 +554,7 @@ mod tests {
     #[test]
     fn leading_and_trailing_gaps() {
         // Target added half way through the window, then paused.
-        let s: Vec<Sample> = (0..20).map(|i| (300_000 + i * 2500, Some(2.0), Some(2500))).collect();
+        let s: Vec<Sample> = (0..20).map(|i| Sample::from_ms(300_000 + i * 2500, Some(2.0), Some(2500))).collect();
         let t = timeline(&s, 0, 600_000, 700, 2500);
         assert_eq!(t.gaps.first(), Some(&[0, 300_000]));
         assert_eq!(t.gaps.last().unwrap()[1], 600_000);

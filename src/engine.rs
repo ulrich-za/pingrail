@@ -85,6 +85,7 @@ pub struct Engine {
     tasks: tokio::sync::Mutex<HashMap<i64, Running>>,
     writer: Mutex<Option<JoinHandle<()>>>,
     pub rdns: Arc<Rdns>,
+    pub dns: Arc<crate::dns::DnsWatch>,
     storage_check: Arc<Notify>,
 }
 
@@ -92,13 +93,18 @@ impl Engine {
     /// Start the engine and launch every enabled target.
     pub async fn start(store: Arc<Store>, prober: Arc<Prober>, cfg: &Config, data_dir: Option<PathBuf>) -> Result<Arc<Engine>> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let writer = tokio::spawn(writer_loop(store.clone(), rx));
+        let writer = tokio::spawn(writer_loop(store.clone(), rx, cfg.storage.write_interval()));
         let retention = cfg.storage.retention_days.max(1) as i64;
         let st = store.clone();
         tokio::spawn(async move {
             let mut iv = tokio::time::interval(Duration::from_secs(3600));
             loop {
                 iv.tick().await;
+                // Anything a removed target left behind (say the service
+                // stopped before its samples were cleared).
+                if let Err(e) = blocking(&st, |s| s.purge_deleted()).await {
+                    tracing::warn!("clearing removed targets' samples failed: {e:#}");
+                }
                 let cutoff = now_ms() - retention * 86_400_000;
                 match blocking(&st, move |s| s.prune(cutoff)).await {
                     Ok(n) if n > 0 => tracing::info!("pruned {n} old samples"),
@@ -128,6 +134,7 @@ impl Engine {
             tasks: tokio::sync::Mutex::new(HashMap::new()),
             writer: Mutex::new(Some(writer)),
             rdns: Arc::new(Rdns::new(cfg.probe.reverse_dns)),
+            dns: crate::dns::DnsWatch::start(cfg.probe.identify_dns),
             storage_check,
             store,
         });
@@ -258,13 +265,15 @@ async fn visitor_storage_loop(
     }
 }
 
-async fn writer_loop(store: Arc<Store>, mut rx: mpsc::UnboundedReceiver<RoundRecord>) {
+/// Save samples in batches: everything that arrives within `every` of the
+/// first goes to disk in one write.
+async fn writer_loop(store: Arc<Store>, mut rx: mpsc::UnboundedReceiver<RoundRecord>, every: Duration) {
     let mut batch = Vec::new();
     loop {
         let Some(first) = rx.recv().await else { break };
         batch.push(first);
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
-        while batch.len() < 1000 {
+        let deadline = tokio::time::Instant::now() + every;
+        while batch.len() < 5000 {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(r)) => batch.push(r),
                 _ => break,

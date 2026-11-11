@@ -195,10 +195,10 @@ pub fn routes() -> Router<St> {
     Router::new()
         .route("/s/{token}", get(page))
         .route("/api/s/{token}/info", get(info))
-        .route("/api/s/{token}/overview", get(overview))
+        .route("/api/s/{token}/overview", get(overview).layer(axum::middleware::from_fn(crate::http::gzip_json)))
         .route("/api/s/{token}/targets", axum::routing::post(add_target))
         .route("/api/s/{token}/targets/{id}", patch(patch_target).delete(delete_target))
-        .route("/api/s/{token}/targets/{id}/detail", get(detail))
+        .route("/api/s/{token}/targets/{id}/detail", get(detail).layer(axum::middleware::from_fn(crate::http::gzip_json)))
         .route("/api/s/{token}/report", get(report_handler))
 }
 
@@ -257,11 +257,7 @@ async fn page(
         Err(e) => return refused(e),
     };
     let v = Visitor { add: share.settings.can_add, export: share.settings.can_export };
-    (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-store")],
-        crate::pages::pages().share_html(v),
-    )
-        .into_response()
+    crate::http::packed(crate::pages::pages().share_html(v)).response(&headers, "text/html; charset=utf-8", false)
 }
 
 fn json_bytes(body: Vec<u8>) -> Response {
@@ -444,10 +440,15 @@ async fn overview(
     let thresholds = st.cfg.thresholds;
     let now = now_ms();
     let sc = scope(&share, now);
-    let ov = blocking_share(&st.store, move |s| {
+    let mut ov = blocking_share(&st.store, move |s| {
         analysis::overview_scoped(s, &|id| engine.live(id), thresholds, now, window, 40, &sc)
     })
     .await?;
+    // Whose DNS the monitor uses names its internet provider, like the
+    // first public hops do: a link that hides those hides this too.
+    if share.settings.hide_public_hops == 0 {
+        ov.dns = st.engine.dns.view().and_then(|v| v.public());
+    }
     let body = serde_json::to_vec(&ov).map_err(anyhow::Error::from)?;
     st.share.store(key, LIVE_TTL, body.clone());
     Ok(json_bytes(body))
@@ -630,6 +631,7 @@ async fn delete_target(
     }
     blocking(&st.store, move |s| s.delete_target(id)).await?;
     st.engine.sync().await?;
+    crate::store::purge_soon(&st.store);
     st.share.invalidate(share.id);
     Ok(StatusCode::NO_CONTENT)
 }

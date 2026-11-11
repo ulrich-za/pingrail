@@ -25,7 +25,7 @@ Download the installer or package for your system from the [latest release](http
 
 ### Windows 10/11 and Windows Server
 
-Run `pingrail-0.3.2-x64.msi`. It:
+Run `pingrail-0.3.3-x64.msi`. It:
 
 - installs `pingrail.exe` to `C:\Program Files\pingrail` and adds that folder to `PATH`;
 - adds a **pingrail** Start menu shortcut (opens the TUI);
@@ -53,7 +53,7 @@ else needs installing either: the OpenSSL that passkeys use is compiled into
 ### Debian, Ubuntu, Raspberry Pi OS
 
 ```sh
-sudo apt install ./pingrail_0.3.2-1_amd64.deb     # or _arm64.deb on a Raspberry Pi 4/5
+sudo apt install ./pingrail_0.3.3-1_amd64.deb     # or _arm64.deb on a Raspberry Pi 4/5
 ```
 
 The package:
@@ -80,7 +80,7 @@ sudo ./target/release/pingrail service install     # Linux: systemd unit + start
 # Windows (Administrator prompt): pingrail.exe service install
 ```
 
-Requires Rust 1.88+. `packaging/build-release.sh` builds the .deb packages and the MSI;
+Requires Rust 1.89+. `packaging/build-release.sh` builds the .deb packages and the MSI;
 see [Building the Windows installer](#building-the-windows-installer) to build just the MSI.
 Reports look for the DejaVu fonts in `assets/fonts` during development; installed
 copies find them beside the program (`fonts\` on Windows), in
@@ -104,6 +104,14 @@ once more. Other changes you'll notice:
   or "pingrail".
 - Someone guessing passwords can no longer slow down your own sign-in: limits
   are per visitor, and a browser that has signed in before has its own.
+
+0.3.3 is mostly a speed release, with nothing to do on upgrade. Long time
+ranges open about three times faster, a slow request no longer holds up the
+others, hourly clean-up no longer pauses recording, pages and live updates are
+sent compressed, adding or removing a target shows at once (a removed target's
+history is cleared in the background), and the bundled SQLite is updated. It
+also adds [Your DNS](#your-dns) and a setting for how often samples are saved
+(`storage.write_interval_ms`).
 
 ### Upgrading from 0.2
 
@@ -353,6 +361,32 @@ destination, or trace probes to the hop you selected (with no call-quality
 score, which only means something end to end). Reports and the TUI mark hops
 the same way.
 
+### Your DNS
+
+Under a target's name the web UI says whose DNS turns names into addresses on
+this machine, for example *Your DNS: Cloudflare (AS13335), via 192.168.1.1*.
+The terminal app shows the same under the route. The server your machine is set
+to use is usually just the router, so pingrail also finds out who does the
+looking up behind it:
+
+- **your own resolver, on this connection**: lookups are done on your side
+  (Unbound on the router, say);
+- **…, your internet provider**: the resolver is on the same network as your
+  connection;
+- a name and network number alone: a public service or another network.
+
+It works this out with a few ordinary DNS questions every half hour: one to a
+name at Akamai or Google that answers with the address of the resolver that
+asked, one straight to Google's name server for your own public address, and
+Team Cymru's lookup for the networks those belong to. Nothing about your
+targets is sent. Set `probe.identify_dns = false` to show only the configured
+servers. It can't tell you which DNS servers your provider would hand out if
+you aren't using them; only the router is told that.
+
+On a share link the line reads *This monitor's DNS* and gives only whose it
+is, never an address. A link that hides public hops leaves it out, since it
+names your provider just as those hops do.
+
 ## Reports
 
 Every report has a summary page (when it covers more than one target) and one
@@ -390,7 +424,7 @@ send your ISP a different link to the same graphs that also lets them test:
 | Download PDF and PNG reports | Shows *Export report* to visitors. |
 | History they can see | Everything stored, the last N days, or only from when the link was made. |
 | Hide private hops | Your LAN hops show as “private network”. On by default for public links; untick it when showing your own router helps prove a point. |
-| Hide the first N public hops | Hides the first routers of your ISP, which can reveal your provider and area. |
+| Hide the first N public hops | Hides the first routers of your ISP, which can reveal your provider and area. Also hides whose DNS the monitor uses. |
 | Hide hop host names | Drops reverse-DNS names from the route table. |
 | Link works for | No limit, 24 hours, 7 days, 30 days or until a date. |
 | Fastest interval | The shortest sample interval visitors may give their destinations. |
@@ -528,10 +562,13 @@ packet_size = 56
 max_hops = 30
 hop_stagger_ms = 5          # spacing between hop probes in one sample
 reverse_dns = true          # look up hop host names
+identify_dns = true         # work out whose DNS your lookups go through ("Your DNS")
 
 [storage]
 retention_days = 30
 min_free_mb = 1024          # below this, share-link visitors' destinations pause
+write_interval_ms = 250     # how often samples are saved; raise it (up to 10000) for fewer
+                            # disk writes on an SD card, at the cost of graphs running that far behind
 
 [thresholds]                # colours in the TUI, web UI and reports
 warn_ms = 100.0

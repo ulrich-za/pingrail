@@ -6,6 +6,7 @@ mod ca;
 mod client;
 mod config;
 mod daemon;
+mod dns;
 mod engine;
 mod http;
 mod migrate;
@@ -326,7 +327,20 @@ async fn shutdown_signal() {
     }
 }
 
+/// Give memory back when a big request is done. Left alone, glibc keeps the
+/// tens of megabytes a month-long query used in each worker thread's heap for
+/// good; with a fixed threshold, large blocks come straight from the system
+/// and go straight back when freed.
+fn return_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: mallopt only changes allocator settings, before any threads start.
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 256 * 1024);
+    }
+}
+
 fn main() -> ExitCode {
+    return_freed_memory();
     tls::install_default_provider();
     let cli = Cli::parse();
     match real_main(cli) {

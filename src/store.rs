@@ -69,8 +69,17 @@ pub fn encode_hops(hops: &[HopRecord]) -> Vec<u8> {
     out
 }
 
-pub fn decode_hops(mut b: &[u8]) -> Vec<HopRecord> {
+#[cfg(test)]
+pub fn decode_hops(b: &[u8]) -> Vec<HopRecord> {
     let mut out = Vec::new();
+    decode_hops_into(b, &mut out);
+    out
+}
+
+/// Like [`decode_hops`], into a buffer the caller reuses (a month of a
+/// traced target is millions of these).
+pub fn decode_hops_into(mut b: &[u8], out: &mut Vec<HopRecord>) {
+    out.clear();
     while b.len() >= 2 {
         let ttl = b[0];
         let flags = b[1];
@@ -113,25 +122,87 @@ pub fn decode_hops(mut b: &[u8]) -> Vec<HopRecord> {
         };
         out.push(HopRecord { ttl, addr, rtt_us, kind });
     }
-    out
 }
 
 pub struct Store {
     write: Mutex<Connection>,
-    read: Mutex<Connection>,
-    /// Reads made for share-link visitors use their own connection, so busy
+    /// Several connections for reading, so one long query (a month of a
+    /// traced target) doesn't make every other request wait behind it.
+    read: Readers,
+    /// Reads made for share-link visitors use their own connections, so busy
     /// visitors can never make your own web UI or terminal UI wait.
-    share_read: Mutex<Connection>,
+    share_read: Readers,
 }
+
+/// A few read connections, handed out to whoever finds one free.
+struct Readers {
+    conns: Vec<Mutex<Connection>>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl Readers {
+    fn open(path: &Path, n: usize) -> Result<Readers> {
+        let conns = (0..n).map(|_| connect(path).map(Mutex::new)).collect::<Result<Vec<_>>>()?;
+        Ok(Readers { conns, next: std::sync::atomic::AtomicUsize::new(0) })
+    }
+
+    /// A free connection, or, when all are busy, a turn at one of them.
+    fn get(&self) -> std::sync::MutexGuard<'_, Connection> {
+        for c in &self.conns {
+            match c.try_lock() {
+                Ok(g) => return g,
+                Err(std::sync::TryLockError::Poisoned(p)) => return p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+        }
+        let i = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.conns.len();
+        self.conns[i].lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// Read connections for the owner's web UI, terminal UI and reports.
+const READERS: usize = 4;
+/// Read connections shared by all share-link visitors.
+const SHARE_READERS: usize = 2;
 
 thread_local! {
     /// Set while a blocking task runs on behalf of a share-link visitor.
     static SHARE_READER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// One endpoint (or hop) sample: time, round-trip time (None = lost) and the
-/// interval in force (None for samples recorded before that was stored).
-pub type Sample = (i64, Option<f64>, Option<u32>);
+/// One endpoint (or hop) sample, kept small: a month at one sample a second
+/// is 2.6 million of these.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sample {
+    pub ts_ms: i64,
+    /// Round trip in microseconds; `LOST` when there was no reply.
+    rtt_us: u32,
+    /// The interval in force; 0 for samples recorded before that was stored.
+    iv_ms: u32,
+}
+
+impl Sample {
+    const LOST: u32 = u32::MAX;
+
+    pub fn new(ts_ms: i64, rtt_us: Option<u32>, iv_ms: Option<u32>) -> Sample {
+        Sample { ts_ms, rtt_us: rtt_us.map_or(Self::LOST, |u| u.min(Self::LOST - 1)), iv_ms: iv_ms.unwrap_or(0) }
+    }
+
+    /// From a round trip in milliseconds (tests and synthetic data).
+    #[cfg(test)]
+    pub fn from_ms(ts_ms: i64, rtt_ms: Option<f64>, iv_ms: Option<u32>) -> Sample {
+        Sample::new(ts_ms, rtt_ms.map(|m| (m * 1000.0).round() as u32), iv_ms)
+    }
+
+    /// Round trip in milliseconds; `None` = lost.
+    pub fn rtt_ms(&self) -> Option<f64> {
+        (self.rtt_us != Self::LOST).then(|| self.rtt_us as f64 / 1000.0)
+    }
+
+    pub fn interval_ms(&self) -> Option<u32> {
+        (self.iv_ms != 0).then_some(self.iv_ms)
+    }
+}
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -326,13 +397,13 @@ impl Store {
         let w = connect(path)?;
         w.execute_batch(SCHEMA).context("creating schema")?;
         migrate(&w).context("upgrading database")?;
-        let r = connect(path)?;
-        let sr = connect(path)?;
-        Ok(Arc::new(Store { write: Mutex::new(w), read: Mutex::new(r), share_read: Mutex::new(sr) }))
+        let read = Readers::open(path, READERS)?;
+        let share_read = Readers::open(path, SHARE_READERS)?;
+        Ok(Arc::new(Store { write: Mutex::new(w), read, share_read }))
     }
 
     fn reader(&self) -> std::sync::MutexGuard<'_, Connection> {
-        if SHARE_READER.with(|c| c.get()) { self.share_read.lock().unwrap() } else { self.read.lock().unwrap() }
+        if SHARE_READER.with(|c| c.get()) { self.share_read.get() } else { self.read.get() }
     }
 
     // ----- targets -------------------------------------------------------
@@ -414,15 +485,71 @@ impl Store {
         Ok(Some(t))
     }
 
+    /// Remove a target. Its samples stay behind for [`Store::purge_deleted`]
+    /// to clear in the background: deleting a month of them here would keep
+    /// the caller, and every sample waiting to be saved, waiting for seconds.
     pub fn delete_target(&self, id: i64) -> Result<bool> {
         let mut c = self.write.lock().unwrap();
         let tx = c.transaction()?;
         let n = tx.execute("DELETE FROM targets WHERE id=?1", [id])?;
-        tx.execute("DELETE FROM rounds WHERE target_id=?1", [id])?;
-        tx.execute("DELETE FROM hops WHERE target_id=?1", [id])?;
         tx.execute("DELETE FROM target_events WHERE target_id=?1", [id])?;
         tx.commit()?;
         Ok(n > 0)
+    }
+
+    /// Every target id with samples, found by hopping along the key rather
+    /// than reading every row.
+    fn history_ids(&self) -> Result<Vec<i64>> {
+        let c = self.reader();
+        let mut ids = Vec::new();
+        for table in ["rounds", "hops"] {
+            let mut st = c.prepare_cached(&format!(
+                "WITH RECURSIVE t(id) AS (
+                     SELECT MIN(target_id) FROM {table}
+                     UNION ALL
+                     SELECT (SELECT MIN(target_id) FROM {table} WHERE target_id > t.id) FROM t WHERE t.id IS NOT NULL)
+                 SELECT id FROM t WHERE id IS NOT NULL"
+            ))?;
+            for id in st.query_map([], |r| r.get::<_, i64>(0))? {
+                ids.push(id?);
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// Delete the samples of targets that no longer exist, a slice at a
+    /// time with the write lock released in between, so samples of the
+    /// remaining targets keep being saved. Target ids are never reused, so
+    /// nothing a later target records can be caught by this. Returns the
+    /// number of rows deleted.
+    pub fn purge_deleted(&self) -> Result<usize> {
+        const SLICE: i64 = 20_000;
+        let existing: std::collections::HashSet<i64> = self.list_targets()?.into_iter().map(|t| t.id).collect();
+        let mut total = 0;
+        for id in self.history_ids()?.into_iter().filter(|id| !existing.contains(id)) {
+            for table in ["rounds", "hops"] {
+                loop {
+                    let n = {
+                        let c = self.write.lock().unwrap();
+                        c.prepare_cached(&format!(
+                            "DELETE FROM {table} WHERE target_id=?1 AND ts_ms <= COALESCE(
+                                 (SELECT ts_ms FROM {table} WHERE target_id=?1 ORDER BY ts_ms LIMIT 1 OFFSET ?2), ?3)"
+                        ))?
+                        .execute(params![id, SLICE - 1, i64::MAX])?
+                    };
+                    total += n;
+                    if n == 0 {
+                        break;
+                    }
+                    // Let waiting writers in.
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            self.write.lock().unwrap().execute("DELETE FROM target_events WHERE target_id=?1", [id])?;
+        }
+        Ok(total)
     }
 
     /// Pause every target owned by `session` and hand it back to no-one.
@@ -635,17 +762,25 @@ impl Store {
         Ok(())
     }
 
-    /// Endpoint samples in `[from, to)` as (ts_ms, rtt_ms).
-    pub fn load_rounds(&self, target: i64, from: i64, to: i64) -> Result<Vec<(i64, Option<f64>)>> {
+    /// Visit endpoint samples in `[from, to)` in time order without keeping
+    /// them: `f(ts_ms, rtt_ms)`.
+    pub fn for_each_round(&self, target: i64, from: i64, to: i64, mut f: impl FnMut(i64, Option<f64>)) -> Result<()> {
         let c = self.reader();
         let mut st = c.prepare_cached(
             "SELECT ts_ms, rtt_us FROM rounds WHERE target_id=?1 AND ts_ms>=?2 AND ts_ms<?3 ORDER BY ts_ms",
         )?;
-        let rows = st
-            .query_map(params![target, from, to], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?.map(|us| us as f64 / 1000.0)))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rows = st.query(params![target, from, to])?;
+        while let Some(r) = rows.next()? {
+            f(r.get(0)?, r.get::<_, Option<i64>>(1)?.map(|us| us as f64 / 1000.0));
+        }
+        Ok(())
+    }
+
+    /// Endpoint samples in `[from, to)` as (ts_ms, rtt_ms).
+    #[cfg(test)]
+    pub fn load_rounds(&self, target: i64, from: i64, to: i64) -> Result<Vec<(i64, Option<f64>)>> {
+        let mut rows = Vec::new();
+        self.for_each_round(target, from, to, |ts, rtt| rows.push((ts, rtt)))?;
         Ok(rows)
     }
 
@@ -657,9 +792,9 @@ impl Store {
         )?;
         let rows = st
             .query_map(params![target, from, to], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, Option<i64>>(1)?.map(|us| us as f64 / 1000.0),
+                Ok(Sample::new(
+                    r.get(0)?,
+                    r.get::<_, Option<i64>>(1)?.map(|us| us.clamp(0, u32::MAX as i64) as u32),
                     r.get::<_, Option<i64>>(2)?.map(|v| v.clamp(1, u32::MAX as i64) as u32),
                 ))
             })?
@@ -668,26 +803,51 @@ impl Store {
     }
 
     /// Visit per-hop samples in `[from, to)` in time order without keeping
-    /// them: `f(ts_ms, hops, interval_ms)`.
+    /// them: `f(ts_ms, hops, interval_ms)`. The interval each was taken at
+    /// is only looked up `with_intervals` (it lives with the endpoint
+    /// samples, read alongside in step).
     pub fn for_each_hops(
         &self,
         target: i64,
         from: i64,
         to: i64,
+        with_intervals: bool,
         mut f: impl FnMut(i64, &[HopRecord], Option<u32>),
     ) -> Result<()> {
         let c = self.reader();
-        let mut st = c.prepare_cached(
-            "SELECT h.ts_ms, h.data, r.interval_ms FROM hops h
-             LEFT JOIN rounds r ON r.target_id = h.target_id AND r.ts_ms = h.ts_ms
-             WHERE h.target_id=?1 AND h.ts_ms>=?2 AND h.ts_ms<?3 ORDER BY h.ts_ms",
+        let mut st =
+            c.prepare_cached("SELECT ts_ms, data FROM hops WHERE target_id=?1 AND ts_ms>=?2 AND ts_ms<?3 ORDER BY ts_ms")?;
+        let mut ivs = c.prepare_cached(
+            "SELECT ts_ms, interval_ms FROM rounds WHERE target_id=?1 AND ts_ms>=?2 AND ts_ms<?3 ORDER BY ts_ms",
         )?;
+        let mut iv_rows = if with_intervals { Some(ivs.query(params![target, from, to])?) } else { None };
+        // The endpoint sample at or after the hop sample being visited.
+        let mut pending: Option<(i64, Option<i64>)> = None;
+        let mut buf: Vec<HopRecord> = Vec::with_capacity(32);
         let mut rows = st.query(params![target, from, to])?;
         while let Some(r) = rows.next()? {
             let ts: i64 = r.get(0)?;
-            let blob = r.get_ref(1)?.as_blob()?;
-            let iv = r.get::<_, Option<i64>>(2)?.map(|v| v.clamp(1, u32::MAX as i64) as u32);
-            f(ts, &decode_hops(blob), iv);
+            let mut iv = None;
+            if let Some(iv_rows) = iv_rows.as_mut() {
+                loop {
+                    match pending {
+                        Some((t, v)) if t == ts => {
+                            iv = v;
+                            break;
+                        }
+                        Some((t, _)) if t > ts => break,
+                        _ => match iv_rows.next()? {
+                            Some(x) => pending = Some((x.get(0)?, x.get(1)?)),
+                            None => {
+                                pending = Some((i64::MAX, None));
+                                break;
+                            }
+                        },
+                    }
+                }
+            }
+            decode_hops_into(r.get_ref(1)?.as_blob()?, &mut buf);
+            f(ts, &buf, iv.map(|v| v.clamp(1, u32::MAX as i64) as u32));
         }
         Ok(())
     }
@@ -720,12 +880,21 @@ impl Store {
         Ok(total)
     }
 
+    /// Delete everything older than `before_ms`. Target by target, so each
+    /// delete goes straight to the old rows by key: a plain "older than"
+    /// reads the whole table, hourly, while sample writes wait.
     pub fn prune(&self, before_ms: i64) -> Result<usize> {
-        let c = self.write.lock().unwrap();
-        let a = c.execute("DELETE FROM rounds WHERE ts_ms < ?1", [before_ms])?;
-        let b = c.execute("DELETE FROM hops WHERE ts_ms < ?1", [before_ms])?;
-        c.execute("DELETE FROM target_events WHERE ts_ms < ?1", [before_ms])?;
-        Ok(a + b)
+        // Deleted targets' leftovers included.
+        let ids = self.history_ids()?;
+        let mut n = 0;
+        for id in ids {
+            // One short write at a time, so samples keep being saved between them.
+            let c = self.write.lock().unwrap();
+            n += c.prepare_cached("DELETE FROM rounds WHERE target_id=?1 AND ts_ms < ?2")?.execute(params![id, before_ms])?;
+            n += c.prepare_cached("DELETE FROM hops WHERE target_id=?1 AND ts_ms < ?2")?.execute(params![id, before_ms])?;
+        }
+        self.write.lock().unwrap().execute("DELETE FROM target_events WHERE ts_ms < ?1", [before_ms])?;
+        Ok(n)
     }
 
     // ----- settings kept in the database -----------------------------------
@@ -847,6 +1016,23 @@ pub fn peek_meta(db: &Path, key: &str) -> Option<String> {
     c.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0)).ok()
 }
 
+/// Clear deleted targets' samples in the background (see
+/// [`Store::purge_deleted`]). A second pass a few seconds later catches
+/// samples that were still on their way to disk when the target went.
+pub fn purge_soon(store: &Arc<Store>) {
+    let store = store.clone();
+    tokio::spawn(async move {
+        for wait in [0u64, 5] {
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            match blocking(&store, |s| s.purge_deleted()).await {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!("cleared {n} rows of removed targets"),
+                Err(e) => tracing::warn!("clearing removed targets' samples failed: {e:#}"),
+            }
+        }
+    });
+}
+
 /// Run a blocking store operation off the async runtime.
 pub async fn blocking<T, F>(store: &Arc<Store>, f: F) -> Result<T>
 where
@@ -938,6 +1124,88 @@ mod tests {
     }
 
     #[test]
+    fn hop_samples_come_with_their_intervals_only_when_asked() {
+        let dir = std::env::temp_dir().join(format!("pingrail-test-{}", crate::config::random_hex(4)));
+        let s = Store::open(&dir.join("t.db")).unwrap();
+        let t = s.add_target(&NewTarget { host: "192.0.2.1".into(), ..Default::default() }, 1000).unwrap();
+        let hop = |ttl| HopRecord { ttl, addr: Some("10.0.0.1".parse().unwrap()), rtt_us: Some(900), kind: HopKind::TimeExceeded };
+        let round = |ts, iv| RoundRecord { target_id: t.id, ts_ms: ts, interval_ms: iv, rtt_us: Some(1500), hops: Some(vec![hop(1), hop(2)]) };
+        s.insert_rounds(&[round(1000, 1000), round(2000, 1000), round(4000, 2500)]).unwrap();
+        // An endpoint sample with no hop sample, a hop sample whose endpoint
+        // sample is gone, and one saved before intervals were.
+        s.insert_rounds(&[RoundRecord { target_id: t.id, ts_ms: 3000, interval_ms: 1000, rtt_us: None, hops: None }]).unwrap();
+        {
+            let c = s.write.lock().unwrap();
+            c.execute("INSERT INTO hops (target_id, ts_ms, data) VALUES (?1, 5000, ?2)", params![t.id, encode_hops(&[hop(1)])]).unwrap();
+            c.execute("INSERT INTO hops (target_id, ts_ms, data) VALUES (?1, 6000, ?2)", params![t.id, encode_hops(&[hop(1)])]).unwrap();
+            c.execute("INSERT INTO rounds (target_id, ts_ms, rtt_us, interval_ms) VALUES (?1, 6000, 5, NULL)", params![t.id]).unwrap();
+        }
+        let mut seen = Vec::new();
+        s.for_each_hops(t.id, 0, 10_000, true, |ts, hs, iv| seen.push((ts, hs.len(), iv))).unwrap();
+        assert_eq!(seen, vec![(1000, 2, Some(1000)), (2000, 2, Some(1000)), (4000, 2, Some(2500)), (5000, 1, None), (6000, 1, None)]);
+        let mut plain = Vec::new();
+        s.for_each_hops(t.id, 1500, 4500, false, |ts, hs, iv| plain.push((ts, hs.len(), iv))).unwrap();
+        assert_eq!(plain, vec![(2000, 2, None), (4000, 2, None)], "the range, and no intervals unless asked");
+        let rows = s.load_samples(t.id, 0, 10_000).unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!((rows[0].rtt_ms(), rows[0].interval_ms()), (Some(1.5), Some(1000)));
+        assert_eq!((rows[2].rtt_ms(), rows[2].interval_ms()), (None, Some(1000)), "a lost sample");
+        assert_eq!(rows[4].interval_ms(), None, "saved before intervals were");
+        assert_eq!(std::mem::size_of::<Sample>(), 16);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn pruning_goes_target_by_target_and_takes_leftovers_too() {
+        let dir = std::env::temp_dir().join(format!("pingrail-test-{}", crate::config::random_hex(4)));
+        let s = Store::open(&dir.join("t.db")).unwrap();
+        let a = s.add_target(&NewTarget { host: "192.0.2.1".into(), ..Default::default() }, 1000).unwrap();
+        let b = s.add_target(&NewTarget { host: "192.0.2.2".into(), ..Default::default() }, 1000).unwrap();
+        let hops = Some(vec![HopRecord { ttl: 1, addr: None, rtt_us: None, kind: HopKind::Timeout }]);
+        for id in [a.id, b.id, 999] {
+            let rows: Vec<RoundRecord> =
+                (0..10).map(|i| RoundRecord { target_id: id, ts_ms: i * 1000, interval_ms: 1000, rtt_us: Some(1), hops: hops.clone() }).collect();
+            s.insert_rounds(&rows).unwrap();
+        }
+        assert_eq!(s.prune(4000).unwrap(), 3 * 2 * 4, "four old samples and their hops, for each, the unknown target's too");
+        for id in [a.id, b.id, 999] {
+            assert_eq!(s.load_rounds(id, 0, i64::MAX).unwrap().first().map(|r| r.0), Some(4000));
+        }
+        assert_eq!(s.prune(4000).unwrap(), 0);
+        // The deletes go by key, not by reading the table.
+        let c = s.write.lock().unwrap();
+        let plan: String = c
+            .query_row("EXPLAIN QUERY PLAN DELETE FROM hops WHERE target_id=1 AND ts_ms < 5", [], |r| r.get(3))
+            .unwrap();
+        assert!(plan.contains("SEARCH"), "{plan}");
+        drop(c);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_long_read_does_not_hold_up_the_others() {
+        let dir = std::env::temp_dir().join(format!("pingrail-test-{}", crate::config::random_hex(4)));
+        let s = Store::open(&dir.join("t.db")).unwrap();
+        // Someone is in the middle of a long query...
+        let busy = s.reader();
+        let s2 = s.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(s2.list_targets().map(|t| t.len()).ok()).ok());
+        let other = rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(other, Ok(Some(0)), "another read went ahead meanwhile");
+        drop(busy);
+        // With every connection busy, a read waits its turn rather than failing.
+        let all: Vec<_> = (0..READERS).map(|_| s.reader()).collect();
+        let s3 = s.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(s3.list_targets().is_ok()).ok());
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "waits while all are busy");
+        drop(all);
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(true));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn address_changes_are_recorded_once() {
         let dir = std::env::temp_dir().join(format!("pingrail-test-{}", crate::config::random_hex(4)));
         let s = Store::open(&dir.join("t.db")).unwrap();
@@ -985,6 +1253,38 @@ mod tests {
         assert_eq!(s.end_session("abc", true).unwrap(), 1);
         assert!(s.get_target(t.id).unwrap().unwrap().is_background());
         assert!(s.delete_target(t.id).unwrap());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn removing_a_target_is_quick_and_its_samples_are_cleared_after() {
+        let dir = std::env::temp_dir().join(format!("pingrail-test-{}", crate::config::random_hex(4)));
+        let s = Store::open(&dir.join("t.db")).unwrap();
+        let gone = s.add_target(&NewTarget { host: "1.1.1.1".into(), ..Default::default() }, 1000).unwrap();
+        let kept = s.add_target(&NewTarget { host: "9.9.9.9".into(), ..Default::default() }, 1000).unwrap();
+        let hops = Some(vec![HopRecord { ttl: 1, addr: None, rtt_us: None, kind: HopKind::Timeout }]);
+        for id in [gone.id, kept.id] {
+            // More than one slice, so the loop is exercised.
+            let rows: Vec<RoundRecord> = (0..45_000)
+                .map(|i| RoundRecord { target_id: id, ts_ms: i, interval_ms: 1000, rtt_us: Some(1), hops: if i % 9 == 0 { hops.clone() } else { None } })
+                .collect();
+            s.insert_rounds(&rows).unwrap();
+        }
+        s.record_address(gone.id, 5, Some("1.1.1.1"), "1.0.0.1").unwrap();
+        assert!(s.delete_target(gone.id).unwrap());
+        // Gone from the list at once; its samples are still on disk.
+        assert!(s.get_target(gone.id).unwrap().is_none());
+        assert_eq!(s.load_rounds(gone.id, 0, i64::MAX).unwrap().len(), 45_000);
+        assert_eq!(s.purge_deleted().unwrap(), 45_000 + 5_000);
+        assert!(s.load_rounds(gone.id, 0, i64::MAX).unwrap().is_empty());
+        let mut hop_rows = 0;
+        s.for_each_hops(gone.id, 0, i64::MAX, false, |_, _, _| hop_rows += 1).unwrap();
+        assert_eq!(hop_rows, 0);
+        // The other target is untouched, and a new one never takes the old id.
+        assert_eq!(s.load_rounds(kept.id, 0, i64::MAX).unwrap().len(), 45_000);
+        assert_eq!(s.purge_deleted().unwrap(), 0);
+        let next = s.add_target(&NewTarget { host: "8.8.8.8".into(), ..Default::default() }, 1000).unwrap();
+        assert!(next.id > kept.id && next.id != gone.id);
         std::fs::remove_dir_all(dir).ok();
     }
 
