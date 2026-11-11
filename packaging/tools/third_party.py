@@ -127,8 +127,13 @@ def main():
       "      (the Latin files exactly as Google Fonts publishes them, unmodified):\n"
       "      SIL Open Font License 1.1, texts below.\n"
       "      https://github.com/github/mona-sans  https://github.com/evilmartians/mono\n")
-    w("  DejaVu fonts, used for reports, ship as separate files (fonts/), not part of\n"
-      "      the program: Bitstream Vera / DejaVu licence, see fonts/LICENSE-DejaVu.txt.\n\n")
+    w("  Source Sans 3 and Source Serif 4, the typefaces of PDF and PNG reports, are\n"
+      "      built into the program (the files exactly as Adobe publishes them,\n"
+      "      unmodified): SIL Open Font License 1.1, texts below.\n"
+      "      https://github.com/adobe-fonts/source-sans  https://github.com/adobe-fonts/source-serif\n")
+    w("  DejaVu fonts, which reports use for characters those two lack, ship as separate\n"
+      "      files (fonts/), not part of the program: Bitstream Vera / DejaVu licence,\n"
+      "      see fonts/LICENSE-DejaVu.txt.\n\n")
     w("Components\n----------\n")
     w("\n".join(index) + "\n\n")
     w("Licence texts\n-------------\n\n")
@@ -143,9 +148,11 @@ def main():
       "Copyright (c) The Rust Project Contributors\n\n" + GENERIC_MIT + "\n")
     if openssl:
         w("\n" + "-" * 72 + f"\nApplies to: OpenSSL {openssl[0]}\n\n" + openssl[1] + "\n")
-    # Web fonts built into the program
+    # Fonts built into the program
     for name, f in [("Mona Sans (web UI font)", "assets/fonts/web/LICENSE-MonaSans.txt"),
-                    ("Martian Mono (web UI font)", "assets/fonts/web/LICENSE-MartianMono.txt")]:
+                    ("Martian Mono (web UI font)", "assets/fonts/web/LICENSE-MartianMono.txt"),
+                    ("Source Sans 3 (report font)", "assets/fonts/report/LICENSE-SourceSans3.txt"),
+                    ("Source Serif 4 (report font)", "assets/fonts/report/LICENSE-SourceSerif4.txt")]:
         w("\n" + "-" * 72 + f"\nApplies to: {name}\n\n" + open(f, encoding="utf-8").read().strip() + "\n")
 
 

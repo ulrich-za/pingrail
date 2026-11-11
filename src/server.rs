@@ -841,7 +841,15 @@ async fn report_handler(State(st): State<St>, Query(q): Query<ReportQuery>) -> A
     let rdns = st.engine.rdns.clone();
     let thresholds = st.cfg.thresholds;
     let fname = report::file_name(&req);
-    let bytes = blocking(&st.store, move |s| report::render(s, Some(&rdns), thresholds, &req, &analysis::Scope::everything())).await?;
+    // The DNS line is worded for whoever the report is handed to: whose
+    // resolver it is, and no addresses.
+    let monitor = report::Monitor {
+        host: crate::util::hostname(),
+        dns: st.engine.dns.view().and_then(|v| v.public()).map(|v| v.text),
+        retention_days: st.cfg.storage.retention_days,
+    };
+    let bytes =
+        blocking(&st.store, move |s| report::render(s, Some(&rdns), thresholds, &req, &analysis::Scope::everything(), &monitor)).await?;
     Ok((
         [
             (header::CONTENT_TYPE, HeaderValue::from_static(format.mime())),

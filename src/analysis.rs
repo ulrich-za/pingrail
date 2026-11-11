@@ -35,6 +35,76 @@ impl Scope {
     }
 }
 
+/// Everything on record for one target, however short the period a report
+/// covers: the totals, and the pings sent and lost over time.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Recorded {
+    pub sent: u64,
+    pub lost: u64,
+    pub avg_ms: Option<f64>,
+    pub max_ms: Option<f64>,
+    /// The first and last ping on record.
+    pub first_ms: Option<i64>,
+    pub last_ms: Option<i64>,
+    /// Minutes each of `bars` covers.
+    pub step_min: i64,
+    /// `(start, sent, lost)` for each stretch of `step_min` minutes from the
+    /// first ping to the last, oldest first. `start` counts stretches from
+    /// 1970 in the reader's time zone, so hours and days line up with the
+    /// clock on the page.
+    pub bars: Vec<(i64, u64, u64)>,
+}
+
+impl Recorded {
+    pub fn loss_pct(&self) -> f64 {
+        if self.sent == 0 { 0.0 } else { 100.0 * self.lost as f64 / self.sent as f64 }
+    }
+}
+
+/// Lengths of time, in minutes, that one bar of [`Recorded::bars`] may cover.
+const BAR_STEPS: &[i64] = &[1, 5, 15, 60, 120, 180, 360, 720, 1440];
+/// History is cut into at most this many bars, unless a day each makes more.
+const MAX_BARS: i64 = 31;
+
+/// What is on record for `target` up to `now`, as far back as `scope` lets
+/// the reader see. Only pings to the target itself are counted: a hop on
+/// the way that does not answer is not a lost ping.
+///
+/// The database adds each bar up itself, so a month of pings a second is
+/// counted without a row of it being read out.
+pub fn recorded(store: &Store, target: i64, scope: &Scope, now: i64, tz_offset_ms: i64) -> Result<Recorded> {
+    let mut r = Recorded::default();
+    if !scope.allows(target) {
+        return Ok(r);
+    }
+    let (from, to) = (scope.clamp_from(i64::MIN), now.saturating_add(1));
+    let Some((first, last)) = store.round_bounds(target, from, to)? else {
+        return Ok(r);
+    };
+    r.first_ms = Some(first);
+    r.last_ms = Some(last);
+    let minute = |ms: i64| (ms + tz_offset_ms).div_euclid(60_000);
+    let (a, b) = (minute(first), minute(last));
+    let step = *BAR_STEPS.iter().find(|s| b.div_euclid(**s) - a.div_euclid(**s) < MAX_BARS).unwrap_or(&1440);
+    r.step_min = step;
+    let (mut sum_us, mut max_us) = (0.0f64, 0i64);
+    for k in a.div_euclid(step)..=b.div_euclid(step) {
+        let start = k * step * 60_000 - tz_offset_ms;
+        let (sent, answered, sum, max) = store.round_totals(target, start.max(first), (start + step * 60_000).min(last + 1))?;
+        r.bars.push((k, sent, sent - answered));
+        r.sent += sent;
+        r.lost += sent - answered;
+        sum_us += sum;
+        max_us = max_us.max(max);
+    }
+    let answered = r.sent - r.lost;
+    if answered > 0 {
+        r.avg_ms = Some(sum_us / answered as f64 / 1000.0);
+        r.max_ms = Some(max_us as f64 / 1000.0);
+    }
+    Ok(r)
+}
+
 /// Hop details hidden from share-link visitors.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Privacy {

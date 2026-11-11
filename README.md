@@ -25,7 +25,7 @@ Download the installer or package for your system from the [latest release](http
 
 ### Windows 10/11 and Windows Server
 
-Run `pingrail-0.3.3-x64.msi`. It:
+Run `pingrail-0.3.4-x64.msi`. It:
 
 - installs `pingrail.exe` to `C:\Program Files\pingrail` and adds that folder to `PATH`;
 - adds a **pingrail** Start menu shortcut (opens the TUI);
@@ -41,7 +41,7 @@ Run `pingrail-0.3.3-x64.msi`. It:
 Data lives in `C:\ProgramData\pingrail` (config, database, API token, log, the
 certificate authority `ca.pem` / `ca-key.pem` and the HTTPS certificate
 `cert.pem` / `key.pem`; the keys are readable only by the service, SYSTEM and
-Administrators). Report fonts are in
+Administrators). Fonts that reports use for other scripts are in
 `C:\Program Files\pingrail\fonts`.
 Uninstall from *Settings → Apps*; your data folder is kept.
 
@@ -53,7 +53,7 @@ else needs installing either: the OpenSSL that passkeys use is compiled into
 ### Debian, Ubuntu, Raspberry Pi OS
 
 ```sh
-sudo apt install ./pingrail_0.3.3-1_amd64.deb     # or _arm64.deb on a Raspberry Pi 4/5
+sudo apt install ./pingrail_0.3.4-1_amd64.deb     # or _arm64.deb on a Raspberry Pi 4/5
 ```
 
 The package:
@@ -82,10 +82,11 @@ sudo ./target/release/pingrail service install     # Linux: systemd unit + start
 
 Requires Rust 1.89+. `packaging/build-release.sh` builds the .deb packages and the MSI;
 see [Building the Windows installer](#building-the-windows-installer) to build just the MSI.
-Reports look for the DejaVu fonts in `assets/fonts` during development; installed
-copies find them beside the program (`fonts\` on Windows), in
+The typefaces reports are set in are built into the program. For characters they
+lack, reports look for the DejaVu fonts in `assets/fonts` during development;
+installed copies find them beside the program (`fonts\` on Windows), in
 `/usr/share/pingrail/fonts`, in the distribution's `fonts-dejavu-core` package, or
-in `PINGRAIL_FONT_DIR`, and fall back to the system's fonts.
+in `PINGRAIL_FONT_DIR`, and turn to the system's fonts for anything DejaVu lacks too.
 
 ### Upgrading from 0.3
 
@@ -104,6 +105,13 @@ once more. Other changes you'll notice:
   or "pingrail".
 - Someone guessing passwords can no longer slow down your own sign-in: limits
   are per visitor, and a browser that has signed in before has its own.
+
+0.3.4 redraws the PDF and PNG [reports](#reports), with nothing to do on
+upgrade. Each now opens with a summary that says in a line whether pings were
+lost, and sets the period you asked for beside everything on record for the
+target ("2 of 300 lost" next to "1,700 of 35,459 lost, 4.79 %"). Lost pings are
+drawn as red lines through the latency graph, and marks are about lost pings
+only: a target that drops any is never shown as fine.
 
 0.3.3 is mostly a speed release, with nothing to do on upgrade. Long time
 ranges open about three times faster, a slow request no longer holds up the
@@ -389,9 +397,28 @@ names your provider just as those hops do.
 
 ## Reports
 
-Every report has a summary page (when it covers more than one target) and one
-page per target with headline stats, a latency chart with the min–max range, a
-packet-loss chart on the same time axis, and the per-hop route table.
+Every report opens with a summary and has a page for each target.
+
+- **The summary** says in a line whether pings were lost, then lists every
+  target twice: for the period you asked for, and for everything pingrail has
+  on record (as far back as `retention_days` goes), so five clean minutes can't
+  hide a bad night. Two bars compare the two.
+- **A target's page** puts the same two side by side: the period's average,
+  slowest, 95th percentile, jitter, pings lost and call quality, and beside
+  them what is on record, with loss over time and the part the report covers
+  outlined. Under them are the latency graph and the route table.
+- **Lost pings** are red lines through the latency graph, with a strip under
+  it. Where a point stands for many pings (long periods), the strip shows the
+  share lost and the line through the graph is kept for when none was answered.
+- **Marks are about lost pings and nothing else**: green when every ping was
+  answered, amber when any was lost, red when none was answered. The summary
+  only shows a tick when nothing was lost, in the period or on record.
+- Only pings to the target count as lost. A hop on the way that doesn't answer
+  is shown in the route table and [read](#reading-a-route) the same way as
+  elsewhere, but is not a lost ping.
+
+On reports made from a share link, "on record" goes back as far as the link
+may show, and the monitor's name is left out.
 
 - **TUI**: `x`, pick a range (current view, last hour/day/week, or exact times),
   the selected or all targets, PDF/PNG/both, and a folder.
@@ -406,7 +433,9 @@ pingrail export --from "2026-10-22 08:00" --to "2026-10-22 12:00" -t "Google DNS
 Times in reports are shown in the requesting computer's time zone. PNG output
 stacks the pages into one tall image.
 
-![Report page](docs/report-page.png)
+| Summary | One target |
+| --- | --- |
+| ![Report summary](docs/report-summary.png) | ![Report page for one target](docs/report-page.png) |
 
 ## Share links
 
@@ -570,7 +599,7 @@ min_free_mb = 1024          # below this, share-link visitors' destinations paus
 write_interval_ms = 250     # how often samples are saved; raise it (up to 10000) for fewer
                             # disk writes on an SD card, at the cost of graphs running that far behind
 
-[thresholds]                # colours in the TUI, web UI and reports
+[thresholds]                # colours in the TUI and web UI
 warn_ms = 100.0
 crit_ms = 200.0
 loss_warn_pct = 1.0
@@ -760,9 +789,10 @@ such restriction.
 The libraries linked into pingrail are listed with their licence texts in
 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) (regenerate it with
 `packaging/tools/third_party.py`). The web UI's fonts, Mona Sans and Martian
-Mono, are built in unmodified under the SIL Open Font License 1.1
-(`assets/fonts/web/`, texts also in the notices). The DejaVu fonts used for
-reports are separate files under their own licence
+Mono, and the reports' typefaces, Source Sans 3 and Source Serif 4, are built in
+unmodified under the SIL Open Font License 1.1 (`assets/fonts/web/` and
+`assets/fonts/report/`, texts also in the notices). The DejaVu fonts that
+reports use for other scripts are separate files under their own licence
 (`assets/fonts/LICENSE-DejaVu.txt`).
 
 The same details are under **☰ → About pingrail** in the web UI, `i` in the TUI

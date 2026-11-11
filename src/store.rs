@@ -776,6 +776,29 @@ impl Store {
         Ok(())
     }
 
+    /// The times of the first and last endpoint sample in `[from, to)`.
+    pub fn round_bounds(&self, target: i64, from: i64, to: i64) -> Result<Option<(i64, i64)>> {
+        let c = self.reader();
+        let mut st = c.prepare_cached("SELECT MIN(ts_ms) FROM rounds WHERE target_id=?1 AND ts_ms>=?2 AND ts_ms<?3")?;
+        let first: Option<i64> = st.query_row(params![target, from, to], |r| r.get(0))?;
+        let mut st = c.prepare_cached("SELECT MAX(ts_ms) FROM rounds WHERE target_id=?1 AND ts_ms>=?2 AND ts_ms<?3")?;
+        let last: Option<i64> = st.query_row(params![target, from, to], |r| r.get(0))?;
+        Ok(first.zip(last))
+    }
+
+    /// Endpoint samples in `[from, to)` added up where they are stored:
+    /// `(sent, answered, round trips summed in µs, slowest in µs)`.
+    pub fn round_totals(&self, target: i64, from: i64, to: i64) -> Result<(u64, u64, f64, i64)> {
+        let c = self.reader();
+        let mut st = c.prepare_cached(
+            "SELECT COUNT(*), COUNT(rtt_us), TOTAL(rtt_us), MAX(rtt_us) FROM rounds WHERE target_id=?1 AND ts_ms>=?2 AND ts_ms<?3",
+        )?;
+        let row = st.query_row(params![target, from, to], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64, r.get::<_, f64>(2)?, r.get::<_, Option<i64>>(3)?.unwrap_or(0)))
+        })?;
+        Ok(row)
+    }
+
     /// Endpoint samples in `[from, to)` as (ts_ms, rtt_ms).
     #[cfg(test)]
     pub fn load_rounds(&self, target: i64, from: i64, to: i64) -> Result<Vec<(i64, Option<f64>)>> {

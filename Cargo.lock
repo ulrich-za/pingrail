@@ -2320,7 +2320,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pingrail"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -2361,6 +2361,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "ttf-parser",
  "uuid",
  "windows-service",
  "windows-sys 0.61.2",

@@ -689,7 +689,14 @@ async fn report_handler(
     let fname = report::file_name(&req);
     let rdns = st.engine.rdns.clone();
     let thresholds = st.cfg.thresholds;
-    let bytes = blocking_share(&st.store, move |s| report::render(s, Some(&rdns), thresholds, &req, &sc)).await?;
+    // A visitor is not told the monitor's name, and a link that hides the
+    // first public hops hides whose DNS it uses too.
+    let monitor = report::Monitor {
+        host: None,
+        dns: (share.settings.hide_public_hops == 0).then(|| st.engine.dns.view().and_then(|v| v.public()).map(|v| v.text)).flatten(),
+        retention_days: st.cfg.storage.retention_days,
+    };
+    let bytes = blocking_share(&st.store, move |s| report::render(s, Some(&rdns), thresholds, &req, &sc, &monitor)).await?;
     Ok((
         [
             (header::CONTENT_TYPE, HeaderValue::from_static(format.mime())),
