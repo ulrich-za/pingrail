@@ -1,5 +1,6 @@
 //! pingrail — multi-target ping and route monitor.
 
+mod alarm;
 mod analysis;
 mod auth;
 mod ca;
@@ -9,6 +10,7 @@ mod daemon;
 mod dns;
 mod engine;
 mod http;
+mod mail;
 mod migrate;
 mod model;
 mod netpolicy;

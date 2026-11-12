@@ -11,6 +11,8 @@ destination and for every hop on the way. It does the job PingPlotter does, as:
 - a password-protected **web UI** served by that service, with the same graphs;
 - **PDF and PNG reports** for any time range, from the TUI, the web UI or the
   command line;
+- **alarms by email** when a target stops answering, loses pings or turns slow,
+  and once more when it is back to normal;
 - **share links** that let someone else (your ISP, a forum) watch chosen graphs
   live in a browser without an account, optionally adding their own destinations.
 
@@ -25,7 +27,7 @@ Download the installer or package for your system from the [latest release](http
 
 ### Windows 10/11 and Windows Server
 
-Run `pingrail-0.3.4-x64.msi`. It:
+Run `pingrail-0.3.5-x64.msi`. It:
 
 - installs `pingrail.exe` to `C:\Program Files\pingrail` and adds that folder to `PATH`;
 - adds a **pingrail** Start menu shortcut (opens the TUI);
@@ -53,7 +55,7 @@ else needs installing either: the OpenSSL that passkeys use is compiled into
 ### Debian, Ubuntu, Raspberry Pi OS
 
 ```sh
-sudo apt install ./pingrail_0.3.4-1_amd64.deb     # or _arm64.deb on a Raspberry Pi 4/5
+sudo apt install ./pingrail_0.3.5-1_amd64.deb     # or _arm64.deb on a Raspberry Pi 4/5
 ```
 
 The package:
@@ -105,6 +107,13 @@ once more. Other changes you'll notice:
   or "pingrail".
 - Someone guessing passwords can no longer slow down your own sign-in: limits
   are per visitor, and a browser that has signed in before has its own.
+
+0.3.5 adds [alarms](#alarms), with nothing to do on upgrade. The three rules
+are on from the start with their usual limits, so a target that is down, losing
+pings or slow shows an alarm in the web UI and the terminal UI straight away.
+Emails start once you fill in who gets them and a mail server, under menu ›
+**Alarms**. A target that is always far away or always slow can be given its
+own limits, or none, from its **Edit** button.
 
 0.3.4 redraws the PDF and PNG [reports](#reports), with nothing to do on
 upgrade. Each now opens with a summary that says in a line whether pings were
@@ -194,6 +203,8 @@ a visitor through a share link) or `paused`.
 | `b` / `B` | move the selected / all foreground targets to the background |
 | `[` `]` | time window: 1 min, 5 min, 10 min … 24 h, 48 h, 7 days, 30 days |
 | `←` `→` / `h` `l` | scroll back / forward in time; `End` returns to live |
+| `A` | alarms: what is going on now, and the latest |
+| `m` | pause the selected target's alarms for 1 hour, or resume them |
 | `x` | export a PDF/PNG report |
 | `w` | web UI address and password status |
 | `P` | set the web UI password |
@@ -437,6 +448,71 @@ stacks the pages into one tall image.
 | --- | --- |
 | ![Report summary](docs/report-summary.png) | ![Report page for one target](docs/report-page.png) |
 
+## Alarms
+
+pingrail raises an alarm when a target:
+
+- **stops answering** for 30 seconds,
+- **loses more than 2 %** of its pings over 5 minutes, or
+- **averages slower than 150 ms** for 5 minutes.
+
+Those are the limits to begin with. Change them, or switch a rule off, in the
+web UI under menu › **Alarms**. One target can have limits of its own, or no
+alarms at all: open the target, choose **Edit**, and look under *Alarms for this
+target*.
+
+While an alarm is going on, the web UI shows a red banner, a red diamond beside
+the target and on its graph where the alarm was raised, and a table of the
+target's alarms under its graphs. The terminal UI shows a red line under its
+header; `A` lists the alarms.
+
+![An alarm in the web UI](docs/alarms.png)
+
+### Emails
+
+To get alarms by email, open menu › **Alarms** and fill in:
+
+1. **Send alarm emails to**: one or more addresses, separated by commas (up to
+   ten). Everyone listed gets every alarm.
+2. **Mail server**: the server your email provider gives for *sending* mail
+   (SMTP), your username and password there, and the address the emails come
+   from. Choose **TLS, port 465** or **STARTTLS, port 587**, whichever your
+   provider names. For another port, add it to the server name:
+   `smtp.example.com:2525`.
+3. **Send a test email**, then **Save**.
+
+Many providers (Gmail, Outlook.com, iCloud) want an *app password* here rather
+than your normal password; make one in your account's security settings.
+
+You get one email when an alarm starts and one when it ends, with how long it
+lasted and how many pings were lost. To keep the emails few:
+
+- A target that drops and comes back over and over (more than 3 alarms in 15
+  minutes) gets one "unstable" email, then nothing until it has been steady
+  for 15 minutes.
+- If every target goes quiet at once, the fault is most likely something they
+  share, such as the connection of the machine pingrail runs on. That is one
+  alarm, not one per target. pingrail tries to email you at once; if the email
+  can't leave because the connection is down, you get one email, with how
+  long it lasted, when the connection is back. The same goes for every target
+  beyond your own network going quiet while those on it still answer.
+- An alarm for lost pings or slowness ends only after the target has stayed
+  under the limit for a while, so a target hovering at the limit doesn't send
+  an email every few minutes.
+- Reminders while an alarm is still going are off unless you ask for one every
+  hour or every day.
+- If the mail server can't be reached, pingrail keeps trying for three days,
+  and sends what was held up as one email.
+
+**Pause alarms** on a target (web UI) or `m` (terminal UI) silences that target
+for an hour, for when you are working on it. Pausing the target itself stops
+its alarms too.
+
+Alarms need the background service: a local session (`pingrail --local`) shows
+them but has no web UI to set up email in. Destinations that a visitor adds
+through a share link never raise alarms, and share links show nothing about
+alarms.
+
 ## Share links
 
 A share link lets someone watch your graphs live in their browser, without an
@@ -643,6 +719,12 @@ loss_crit_pct = 10.0
   private keys of the certificate and its authority are readable only by the
   service (and, on Windows, SYSTEM and Administrators). If they can't be read,
   pingrail stops rather than quietly making a new authority.
+- **Alarm emails** only ever leave over TLS (port 465) or STARTTLS (port 587),
+  with the mail server's certificate checked against the system's trusted
+  authorities; a server that offers neither is refused. The mail password is
+  kept in `mail.key` in the data directory, readable only by the service, and
+  the API never sends it back. Only the owner can see or change alarms: none of
+  it is reachable through a share link.
 - Web passwords are stored as **Argon2id** hashes sized to the machine: on first
   start each check gets 2 % of the memory (or 10 % of what's free, whichever is
   less, between 19 and 256 MiB) and the passes are timed so a check takes about

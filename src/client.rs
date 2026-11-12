@@ -247,6 +247,22 @@ impl Client {
         Ok(Self::check(r).await?.json().await?)
     }
 
+    /// The alarms going on now and the latest that ended.
+    pub async fn alarms(&self) -> Result<crate::alarm::AlarmsList> {
+        self.get_json("/api/alarms").await
+    }
+
+    /// Pause a target's alarms for some minutes; 0 switches them on again.
+    pub async fn pause_alarms(&self, id: i64, minutes: u32) -> Result<crate::alarm::TargetAlarmView> {
+        let r = self
+            .req(reqwest::Method::POST, &format!("/api/targets/{id}/alarm/pause"))
+            .json(&serde_json::json!({ "minutes": minutes }))
+            .send()
+            .await
+            .map_err(|e| self.conn_err(e))?;
+        Ok(Self::check(r).await?.json().await?)
+    }
+
     pub async fn targets(&self) -> Result<Vec<Target>> {
         self.get_json("/api/targets").await
     }

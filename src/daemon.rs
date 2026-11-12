@@ -65,7 +65,9 @@ pub async fn run(
     }
     let port = listener.local_addr()?.port();
     let auth = crate::auth::Auth::start(&paths.db_file(), &store, &certs, crate::auth::Settings::new(&cfg, port)).await?;
-    let state = St::new(store.clone(), engine.clone(), cfg, token, listen, certs, auth);
+    // Emails point at the web UI by this machine's name.
+    let alarms = crate::alarm::Alarms::start(store.clone(), &cfg, paths.data_dir.clone(), system, crate::alarm::web_url(&listen));
+    let state = St::new(store.clone(), engine.clone(), cfg, token, listen, certs, auth, alarms);
     server::serve(state, listener, share_listener, tls, shutdown).await?;
     tracing::info!("shutting down");
     engine.shutdown().await;
@@ -104,7 +106,10 @@ impl Embedded {
         let fingerprint = certs.pin();
         let auth =
             crate::auth::Auth::start(&paths.db_file(), &store, &certs, crate::auth::Settings::new(&cfg, addr.port())).await?;
-        let state = St::new(store, engine.clone(), cfg, token.clone(), addr.to_string(), certs, auth);
+        // A terminal session's address stops working when it closes: its
+        // emails carry no link.
+        let alarms = crate::alarm::Alarms::start(store.clone(), &cfg, paths.data_dir.clone(), false, None);
+        let state = St::new(store, engine.clone(), cfg, token.clone(), addr.to_string(), certs, auth, alarms);
         let (tx, rx) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
             server::serve(state, listener, None, tls, async move {

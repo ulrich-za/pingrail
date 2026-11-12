@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -247,6 +248,37 @@ CREATE TABLE IF NOT EXISTS shares (
     last_seen_ip TEXT,
     views INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS alarms (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_id INTEGER,
+    kind TEXT NOT NULL,
+    since_ms INTEGER NOT NULL,
+    raised_ms INTEGER NOT NULL,
+    ended_ms INTEGER,
+    detail TEXT NOT NULL DEFAULT '{}',
+    mail_note TEXT,
+    mail_start_ms INTEGER,
+    mail_end_ms INTEGER,
+    last_mail_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS alarms_target ON alarms(target_id, raised_ms);
+CREATE TABLE IF NOT EXISTS alarm_targets (
+    target_id INTEGER PRIMARY KEY,
+    config TEXT NOT NULL DEFAULT '{}',
+    pause_until_ms INTEGER
+);
+CREATE TABLE IF NOT EXISTS alarm_mail (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alarm_id INTEGER,
+    phase TEXT NOT NULL,
+    created_ms INTEGER NOT NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_ms INTEGER NOT NULL DEFAULT 0,
+    sent_ms INTEGER,
+    error TEXT
+);
 "#;
 
 /// Columns added after the first release.
@@ -387,6 +419,56 @@ fn row_to_target(r: &rusqlite::Row) -> rusqlite::Result<Target> {
     })
 }
 
+/// An alarm as stored. What `kind` and `detail` mean is `alarm`'s business.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlarmRow {
+    pub id: i64,
+    /// None for an alarm about the monitor itself.
+    pub target_id: Option<i64>,
+    pub kind: String,
+    /// When what the alarm is about began, and when the alarm was raised.
+    pub since_ms: i64,
+    pub raised_ms: i64,
+    pub ended_ms: Option<i64>,
+    pub detail: String,
+    /// Why no email went out for it, when none did.
+    pub mail_note: Option<String>,
+    pub mail_start_ms: Option<i64>,
+    pub mail_end_ms: Option<i64>,
+    pub last_mail_ms: Option<i64>,
+}
+
+const ALARM_COLS: &str = "id, target_id, kind, since_ms, raised_ms, ended_ms, detail, mail_note, mail_start_ms, mail_end_ms, last_mail_ms";
+
+fn row_to_alarm(r: &rusqlite::Row) -> rusqlite::Result<AlarmRow> {
+    Ok(AlarmRow {
+        id: r.get(0)?,
+        target_id: r.get(1)?,
+        kind: r.get(2)?,
+        since_ms: r.get(3)?,
+        raised_ms: r.get(4)?,
+        ended_ms: r.get(5)?,
+        detail: r.get(6)?,
+        mail_note: r.get(7)?,
+        mail_start_ms: r.get(8)?,
+        mail_end_ms: r.get(9)?,
+        last_mail_ms: r.get(10)?,
+    })
+}
+
+/// An email waiting in the outbox.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MailRow {
+    pub id: i64,
+    pub alarm_id: Option<i64>,
+    pub phase: String,
+    pub created_ms: i64,
+    pub subject: String,
+    pub body: String,
+    pub attempts: u32,
+    pub next_ms: i64,
+}
+
 const TARGET_COLS: &str = "id, host, name, interval_ms, trace, enabled, session, created_ms, share_id, restrict_to";
 
 impl Store {
@@ -493,6 +575,9 @@ impl Store {
         let tx = c.transaction()?;
         let n = tx.execute("DELETE FROM targets WHERE id=?1", [id])?;
         tx.execute("DELETE FROM target_events WHERE target_id=?1", [id])?;
+        tx.execute("DELETE FROM alarm_mail WHERE sent_ms IS NULL AND alarm_id IN (SELECT id FROM alarms WHERE target_id=?1)", [id])?;
+        tx.execute("DELETE FROM alarms WHERE target_id=?1", [id])?;
+        tx.execute("DELETE FROM alarm_targets WHERE target_id=?1", [id])?;
         tx.commit()?;
         Ok(n > 0)
     }
@@ -916,7 +1001,11 @@ impl Store {
             n += c.prepare_cached("DELETE FROM rounds WHERE target_id=?1 AND ts_ms < ?2")?.execute(params![id, before_ms])?;
             n += c.prepare_cached("DELETE FROM hops WHERE target_id=?1 AND ts_ms < ?2")?.execute(params![id, before_ms])?;
         }
-        self.write.lock().unwrap().execute("DELETE FROM target_events WHERE ts_ms < ?1", [before_ms])?;
+        let c = self.write.lock().unwrap();
+        c.execute("DELETE FROM target_events WHERE ts_ms < ?1", [before_ms])?;
+        // Alarms are kept as long as the samples they are about.
+        c.execute("DELETE FROM alarms WHERE ended_ms IS NOT NULL AND ended_ms < ?1", [before_ms])?;
+        c.execute("DELETE FROM alarm_mail WHERE created_ms < ?1", [before_ms])?;
         Ok(n)
     }
 
@@ -934,6 +1023,207 @@ impl Store {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    // ----- alarms ------------------------------------------------------------
+    // The rules, wording and emails are in `alarm`; these only keep rows.
+
+    /// When `target` last answered in `[from, to)`.
+    pub fn last_reply(&self, target: i64, from: i64, to: i64) -> Result<Option<i64>> {
+        let c = self.reader();
+        let mut st = c.prepare_cached(
+            "SELECT MAX(ts_ms) FROM rounds WHERE target_id=?1 AND ts_ms>=?2 AND ts_ms<?3 AND rtt_us IS NOT NULL",
+        )?;
+        Ok(st.query_row(params![target, from, to], |r| r.get(0))?)
+    }
+
+    /// The first ping to `target` in `[from, to)`, answered or not.
+    pub fn first_round(&self, target: i64, from: i64, to: i64) -> Result<Option<i64>> {
+        let c = self.reader();
+        let mut st = c.prepare_cached("SELECT MIN(ts_ms) FROM rounds WHERE target_id=?1 AND ts_ms>=?2 AND ts_ms<?3")?;
+        Ok(st.query_row(params![target, from, to], |r| r.get(0))?)
+    }
+
+    /// When `target` first answered in `[from, to)`.
+    pub fn first_reply(&self, target: i64, from: i64, to: i64) -> Result<Option<i64>> {
+        let c = self.reader();
+        let mut st = c.prepare_cached(
+            "SELECT MIN(ts_ms) FROM rounds WHERE target_id=?1 AND ts_ms>=?2 AND ts_ms<?3 AND rtt_us IS NOT NULL",
+        )?;
+        Ok(st.query_row(params![target, from, to], |r| r.get(0))?)
+    }
+
+    pub fn alarm_insert(&self, target: Option<i64>, kind: &str, since_ms: i64, raised_ms: i64, detail: &str, note: Option<&str>) -> Result<i64> {
+        let c = self.write.lock().unwrap();
+        c.execute(
+            "INSERT INTO alarms (target_id, kind, since_ms, raised_ms, detail, mail_note) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![target, kind, since_ms, raised_ms, detail, note],
+        )?;
+        Ok(c.last_insert_rowid())
+    }
+
+    /// Change what is known about an alarm: any of when it ended, its
+    /// details, the note on its emails and when one was last queued.
+    pub fn alarm_update(&self, id: i64, ended_ms: Option<i64>, detail: Option<&str>, note: Option<Option<&str>>, last_mail_ms: Option<i64>) -> Result<()> {
+        let c = self.write.lock().unwrap();
+        if let Some(e) = ended_ms {
+            c.execute("UPDATE alarms SET ended_ms=?2 WHERE id=?1", params![id, e])?;
+        }
+        if let Some(d) = detail {
+            c.execute("UPDATE alarms SET detail=?2 WHERE id=?1", params![id, d])?;
+        }
+        if let Some(n) = note {
+            c.execute("UPDATE alarms SET mail_note=?2 WHERE id=?1", params![id, n])?;
+        }
+        if let Some(m) = last_mail_ms {
+            c.execute("UPDATE alarms SET last_mail_ms=?2 WHERE id=?1", params![id, m])?;
+        }
+        Ok(())
+    }
+
+    /// Alarms that have not ended, oldest first.
+    pub fn alarms_active(&self) -> Result<Vec<AlarmRow>> {
+        let c = self.reader();
+        let mut st = c.prepare_cached(&format!("SELECT {ALARM_COLS} FROM alarms WHERE ended_ms IS NULL ORDER BY raised_ms, id"))?;
+        let rows = st.query_map([], row_to_alarm)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The latest alarms, newest first: one target's, or everything.
+    pub fn alarms_recent(&self, target: Option<i64>, limit: usize) -> Result<Vec<AlarmRow>> {
+        let c = self.reader();
+        let rows = match target {
+            Some(id) => c
+                .prepare_cached(&format!("SELECT {ALARM_COLS} FROM alarms WHERE target_id=?1 ORDER BY raised_ms DESC, id DESC LIMIT ?2"))?
+                .query_map(params![id, limit as i64], row_to_alarm)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => c
+                .prepare_cached(&format!("SELECT {ALARM_COLS} FROM alarms ORDER BY raised_ms DESC, id DESC LIMIT ?1"))?
+                .query_map(params![limit as i64], row_to_alarm)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
+        Ok(rows)
+    }
+
+    /// Alarms still going at `from` or later, of any of `kinds`.
+    pub fn alarms_since(&self, from: i64, kinds: &[&str]) -> Result<Vec<AlarmRow>> {
+        let c = self.reader();
+        let mut st = c.prepare_cached(&format!("SELECT {ALARM_COLS} FROM alarms WHERE ended_ms IS NULL OR ended_ms >= ?1 ORDER BY since_ms"))?;
+        let rows = st.query_map([from], row_to_alarm)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.into_iter().filter(|a| kinds.contains(&a.kind.as_str())).collect())
+    }
+
+    /// How many alarms `target` has raised since `from`.
+    pub fn alarms_raised(&self, target: i64, from: i64) -> Result<u32> {
+        let c = self.reader();
+        Ok(c.query_row("SELECT COUNT(*) FROM alarms WHERE target_id=?1 AND raised_ms>=?2", params![target, from], |r| r.get(0))?)
+    }
+
+    /// Each target's own alarm settings (JSON) and until when its alarms
+    /// are paused, for targets that have either.
+    pub fn alarm_targets(&self) -> Result<HashMap<i64, (String, Option<i64>)>> {
+        let c = self.reader();
+        let mut st = c.prepare_cached("SELECT target_id, config, pause_until_ms FROM alarm_targets")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, (r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?))))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn alarm_target_set(&self, target: i64, config: Option<&str>, pause_until_ms: Option<Option<i64>>) -> Result<()> {
+        let c = self.write.lock().unwrap();
+        c.execute("INSERT OR IGNORE INTO alarm_targets (target_id) VALUES (?1)", [target])?;
+        if let Some(cfg) = config {
+            c.execute("UPDATE alarm_targets SET config=?2 WHERE target_id=?1", params![target, cfg])?;
+        }
+        if let Some(p) = pause_until_ms {
+            c.execute("UPDATE alarm_targets SET pause_until_ms=?2 WHERE target_id=?1", params![target, p])?;
+        }
+        Ok(())
+    }
+
+    /// Put an email in the outbox. `alarm` and `phase` say which alarm it
+    /// is about and whether it reports its start or its end.
+    pub fn mail_queue(&self, alarm: Option<i64>, phase: &str, created_ms: i64, subject: &str, body: &str) -> Result<i64> {
+        let c = self.write.lock().unwrap();
+        c.execute(
+            "INSERT INTO alarm_mail (alarm_id, phase, created_ms, subject, body) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![alarm, phase, created_ms, subject, body],
+        )?;
+        Ok(c.last_insert_rowid())
+    }
+
+    /// Emails waiting to go out, oldest first.
+    pub fn mail_pending(&self) -> Result<Vec<MailRow>> {
+        let c = self.reader();
+        let mut st = c.prepare_cached(
+            "SELECT id, alarm_id, phase, created_ms, subject, body, attempts, next_ms FROM alarm_mail WHERE sent_ms IS NULL ORDER BY id",
+        )?;
+        let rows = st
+            .query_map([], |r| {
+                Ok(MailRow {
+                    id: r.get(0)?,
+                    alarm_id: r.get(1)?,
+                    phase: r.get(2)?,
+                    created_ms: r.get(3)?,
+                    subject: r.get(4)?,
+                    body: r.get(5)?,
+                    attempts: r.get::<_, i64>(6)? as u32,
+                    next_ms: r.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// These emails went out at `sent_ms`: mark them, and their alarms.
+    pub fn mail_sent(&self, rows: &[MailRow], sent_ms: i64) -> Result<()> {
+        let mut c = self.write.lock().unwrap();
+        let tx = c.transaction()?;
+        for m in rows {
+            tx.execute("UPDATE alarm_mail SET sent_ms=?2, error=NULL WHERE id=?1", params![m.id, sent_ms])?;
+            if let Some(a) = m.alarm_id {
+                match m.phase.as_str() {
+                    "start" => tx.execute("UPDATE alarms SET mail_start_ms=?2 WHERE id=?1", params![a, sent_ms])?,
+                    "end" => tx.execute("UPDATE alarms SET mail_end_ms=?2 WHERE id=?1", params![a, sent_ms])?,
+                    _ => 0,
+                };
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// An email did not go out: try again at `next_ms`.
+    pub fn mail_failed(&self, id: i64, next_ms: i64, error: &str) -> Result<()> {
+        let c = self.write.lock().unwrap();
+        c.execute("UPDATE alarm_mail SET attempts=attempts+1, next_ms=?2, error=?3 WHERE id=?1", params![id, next_ms, error])?;
+        Ok(())
+    }
+
+    /// Take back an alarm's email of one phase if it has not gone out yet.
+    /// Returns how many were waiting.
+    pub fn mail_cancel(&self, alarm: i64, phase: &str) -> Result<usize> {
+        let c = self.write.lock().unwrap();
+        Ok(c.execute("DELETE FROM alarm_mail WHERE alarm_id=?1 AND phase=?2 AND sent_ms IS NULL", params![alarm, phase])?)
+    }
+
+    /// Hold an email back until `next_ms` without counting an attempt.
+    pub fn mail_wait(&self, id: i64, next_ms: i64) -> Result<()> {
+        let c = self.write.lock().unwrap();
+        c.execute("UPDATE alarm_mail SET next_ms=?2 WHERE id=?1", params![id, next_ms])?;
+        Ok(())
+    }
+
+    /// Give up on emails queued before `before_ms`. Returns how many.
+    pub fn mail_drop(&self, before_ms: i64) -> Result<usize> {
+        let c = self.write.lock().unwrap();
+        Ok(c.execute("DELETE FROM alarm_mail WHERE sent_ms IS NULL AND created_ms < ?1", [before_ms])?)
+    }
+
+    /// The error the latest email that did not go out failed with.
+    pub fn mail_last_error(&self) -> Result<Option<String>> {
+        let c = self.reader();
+        Ok(c.query_row("SELECT error FROM alarm_mail WHERE sent_ms IS NULL AND error IS NOT NULL ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .optional()?)
     }
 
     // ----- what targets resolve to --------------------------------------

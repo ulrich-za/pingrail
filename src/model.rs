@@ -132,6 +132,10 @@ pub struct Overview {
     /// The DNS the monitor's lookups go through (see `dns`), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<crate::dns::DnsView>,
+    /// Alarms going on now. Only ever filled in for the owner: share-link
+    /// visitors are told nothing about alarms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alarms: Option<crate::alarm::AlarmsNow>,
 }
 
 /// Statistics for one hop of the route.

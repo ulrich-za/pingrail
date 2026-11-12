@@ -121,6 +121,9 @@
     <nav class="windows" id="windows" aria-label="Time window"></nav>
     <div class="topbar-actions">
       <span id="conn" class="conn" role="status"></span>
+      <!--@admin-->
+      <button id="alarms-open" class="quiet alarms-open" hidden><span class="alarm-mark" aria-hidden="true"></span>Alarms <span id="alarms-n" class="alarms-n"></span></button>
+      <!--@end-->
       <!--@export-->
       <button id="export-open" class="quiet">Export report</button>
       <!--@end-->
@@ -128,6 +131,7 @@
       <div id="menu" class="menu" role="menu" hidden>
         <!--@admin-->
         <button role="menuitem" id="shares-open">Share links</button>
+        <button role="menuitem" id="alarm-settings-open">Alarms</button>
         <!--@end-->
         <button role="menuitem" id="theme-toggle">Switch to dark theme</button>
         <!--@admin-->
@@ -145,6 +149,15 @@
   </header>
 
   <section id="banner" class="banner" aria-label="Connection" aria-live="polite" hidden></section>
+  <!--@admin-->
+  <section id="alarm-banner" class="alarm-banner" aria-label="Alarms" aria-live="polite" hidden>
+    <p id="alarm-banner-text"></p>
+    <span class="row">
+      <button id="alarm-banner-show"></button>
+      <button id="alarm-banner-pause" hidden></button>
+    </span>
+  </section>
+  <!--@end-->
   <!--@share-->
   <section id="share-bar" class="share-bar" aria-label="About this shared view" hidden></section>
   <!--@end-->
@@ -191,9 +204,13 @@
             <h1 id="t-name"></h1>
             <p id="t-meta" class="muted"></p>
             <p id="t-dns" class="muted" hidden></p>
+            <!--@admin-->
+            <p id="t-alarm" class="t-alarm" hidden></p>
+            <!--@end-->
           </div>
           <div class="row actions">
             <!--@admin-->
+            <button id="t-alarm-pause" class="quiet" hidden></button>
             <button id="t-share" class="quiet">Share</button>
             <button id="t-bg" class="quiet" hidden>Keep running in background</button>
             <!--@end-->
@@ -230,8 +247,20 @@
               <div id="marks" class="marks"></div>
               <div id="tooltip" class="tooltip" hidden></div>
             </div>
-            <p id="legend" class="legend muted"><span class="key-line"></span> <span id="legend-avg">average</span> <span id="legend-spread-key" class="key-band"></span> <span id="legend-spread">lowest to highest</span> <span class="key-loss"></span> <span id="legend-loss">packet loss</span> <span class="key-gap"></span> no samples <span id="legend-mark" hidden><span class="key-mark"></span> address changed</span></p>
+            <p id="legend" class="legend muted"><span class="key-line"></span> <span id="legend-avg">average</span> <span id="legend-spread-key" class="key-band"></span> <span id="legend-spread">lowest to highest</span> <span class="key-loss"></span> <span id="legend-loss">packet loss</span> <span class="key-gap"></span> no samples <span id="legend-mark" hidden><span class="key-mark"></span> address changed</span><!--@admin--> <span id="legend-alarm" hidden><span class="alarm-mark"></span> alarm raised</span><!--@end--></p>
             <p id="chart-caption" class="hint"></p>
+            <!--@admin-->
+            <section id="t-alarms" class="t-alarms" aria-labelledby="t-alarms-title" hidden>
+              <h2 id="t-alarms-title">Alarms <span class="muted">for this target</span></h2>
+              <div class="table-scroll">
+                <table class="alarm-table">
+                  <thead><tr><th scope="col">Started</th><th scope="col">Ended</th><th scope="col">Lasted</th><th scope="col">What</th><th scope="col" class="num">Pings lost</th><th scope="col">Email</th></tr></thead>
+                  <tbody id="t-alarms-rows"></tbody>
+                </table>
+              </div>
+              <p class="hint" id="t-alarms-note">Kept as long as the target’s samples.</p>
+            </section>
+            <!--@end-->
           </div>
 
           <section id="route" class="route" aria-labelledby="route-title">
@@ -281,6 +310,21 @@
     <label class="check"><input name="trace" type="checkbox" checked> Trace the route and record every hop</label>
     <!--@admin-->
     <p class="hint">Targets added here keep running in the background.</p>
+    <fieldset id="target-alarm" class="rule-set" hidden>
+      <legend>Alarms for this target</legend>
+      <div class="segmented">
+        <label><input type="radio" name="alarm_mode" value="general" checked> The general limits</label>
+        <label><input type="radio" name="alarm_mode" value="own"> Its own limits</label>
+        <label><input type="radio" name="alarm_mode" value="none"> No alarms</label>
+      </div>
+      <div id="target-alarm-own" class="rules" hidden>
+      <p>Raise an alarm when it</p>
+      <div class="rule"><label class="check"><input type="checkbox" name="down"> stops answering for</label> <input name="down_s" type="number" min="5" max="86400" step="1" class="tiny" aria-label="Seconds without a reply"> <span>seconds</span></div>
+      <div class="rule"><label class="check"><input type="checkbox" name="loss"> loses more than</label> <input name="loss_pct" type="number" min="0.01" max="100" step="0.01" class="tiny" aria-label="Percent of pings lost"> <span>% of its pings over</span> <input name="loss_min" type="number" min="1" max="1440" step="1" class="tiny" aria-label="Minutes the loss is counted over"> <span>minutes</span></div>
+      <div class="rule"><label class="check"><input type="checkbox" name="slow"> averages slower than</label> <input name="slow_ms" type="number" min="1" max="60000" step="1" class="tiny" aria-label="Latency limit in milliseconds"> <span>ms for</span> <input name="slow_min" type="number" min="1" max="1440" step="1" class="tiny" aria-label="Minutes the average is taken over"> <span>minutes</span></div>
+      </div>
+      <p class="hint" id="target-alarm-general"></p>
+    </fieldset>
     <!--@end-->
     <!--@share-->
     <p class="hint" id="target-hint">The owner of this monitor can see destinations you add. They stop when this link ends.</p>
@@ -334,6 +378,82 @@
 <!--@end-->
 
 <!--@admin-->
+<!-- Alarms: what is going on, and the latest -->
+<dialog id="alarms-dialog" class="wide" aria-labelledby="alarms-title">
+  <div class="dialog-body">
+    <h2 id="alarms-title">Alarms</h2>
+    <p id="alarms-mail" class="hint"></p>
+    <div class="table-scroll">
+      <table class="alarm-table">
+        <thead><tr><th scope="col">Target</th><th scope="col">Started</th><th scope="col">Ended</th><th scope="col">What</th><th scope="col">Email</th></tr></thead>
+        <tbody id="alarms-rows"></tbody>
+      </table>
+    </div>
+    <p class="hint" id="alarms-empty" hidden>No alarms have been raised.</p>
+    <div class="row end">
+      <button type="button" class="quiet" id="alarms-to-settings">Alarm settings</button>
+      <button type="button" class="primary" data-close>Close</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- Alarms: who is told, when, and through which mail server -->
+<dialog id="alarm-settings-dialog" class="wide" aria-labelledby="alarm-settings-title">
+  <form id="alarm-settings-form" method="dialog">
+    <h2 id="alarm-settings-title">Alarm settings</h2>
+    <p class="hint">pingrail emails you when a target stops answering, loses pings or turns slow, and once more when it is back to normal.</p>
+    <fieldset>
+      <legend>Send alarm emails to</legend>
+      <input name="to" autocomplete="off" spellcheck="false" autocapitalize="none" aria-label="Addresses that get alarm emails" placeholder="you@example.com, office@example.com">
+      <p class="hint">One or more addresses, separated by commas. Everyone listed gets every alarm.</p>
+    </fieldset>
+    <fieldset class="rules">
+      <legend>Raise an alarm when a target</legend>
+      <div class="rule"><label class="check"><input type="checkbox" name="down"> stops answering for</label> <input name="down_s" type="number" min="5" max="86400" step="1" class="tiny" aria-label="Seconds without a reply"> <span>seconds</span></div>
+      <div class="rule"><label class="check"><input type="checkbox" name="loss"> loses more than</label> <input name="loss_pct" type="number" min="0.01" max="100" step="0.01" class="tiny" aria-label="Percent of pings lost"> <span>% of its pings over</span> <input name="loss_min" type="number" min="1" max="1440" step="1" class="tiny" aria-label="Minutes the loss is counted over"> <span>minutes</span></div>
+      <div class="rule"><label class="check"><input type="checkbox" name="slow"> averages slower than</label> <input name="slow_ms" type="number" min="1" max="60000" step="1" class="tiny" aria-label="Latency limit in milliseconds"> <span>ms for</span> <input name="slow_min" type="number" min="1" max="1440" step="1" class="tiny" aria-label="Minutes the average is taken over"> <span>minutes</span></div>
+      <p class="hint">These limits apply to every target. To give one target its own limits, or none, use Edit on that target.</p>
+    </fieldset>
+    <fieldset class="rules">
+      <legend>Keeping it quiet</legend>
+      <div class="rule"><span>If a target raises more than</span> <input name="unstable_count" type="number" min="1" max="100" step="1" class="tiny" aria-label="Alarms before a target counts as unstable"> <span>alarms in</span> <input name="unstable_min" type="number" min="1" max="1440" step="1" class="tiny" aria-label="Minutes those alarms are counted over"> <span>minutes, send one “unstable” email.</span></div>
+      <div class="rule"><span>While an alarm is still going, remind me</span>
+        <span class="segmented">
+          <label><input type="radio" name="remind" value="never" checked> never</label>
+          <label><input type="radio" name="remind" value="hour"> every hour</label>
+          <label><input type="radio" name="remind" value="day"> every day</label>
+        </span>
+      </div>
+      <p class="hint">You get one email when an alarm starts and one when it ends. If every target goes quiet at once, the fault is most likely something they share, such as this machine’s own connection: that is one alarm, not one for each target. If its email can’t leave, you get it when the connection is back.</p>
+    </fieldset>
+    <fieldset>
+      <legend>Mail server</legend>
+      <div class="mail-grid">
+        <label>Server <input name="host" autocomplete="off" spellcheck="false" autocapitalize="none" placeholder="smtp.example.com"></label>
+        <div class="field-like"><span>Connection</span>
+          <span class="segmented">
+            <label><input type="radio" name="security" value="tls" checked> TLS, port 465</label>
+            <label><input type="radio" name="security" value="starttls"> STARTTLS, port 587</label>
+          </span>
+        </div>
+        <label>Username <input name="username" autocomplete="off" spellcheck="false" autocapitalize="none"></label>
+        <label>Password <input name="password" type="password" autocomplete="new-password"></label>
+      </div>
+      <label><span>From <span class="muted">(the name and address the emails come from)</span></span> <input name="from" autocomplete="off" spellcheck="false" placeholder="pingrail &lt;alarms@example.com&gt;"></label>
+      <p class="hint">Mail only ever leaves over an encrypted connection. The password is kept in pingrail’s data folder, readable only by the service, and is never shown again. For a server on another port, add it to the name: smtp.example.com:2525.</p>
+      <div class="row">
+        <button type="button" class="quiet" id="alarm-test">Send a test email</button>
+        <span id="alarm-test-result" class="test-result" role="status"></span>
+      </div>
+    </fieldset>
+    <p class="error" id="alarm-settings-error" role="alert"></p>
+    <div class="row end">
+      <button type="button" class="quiet" data-close>Cancel</button>
+      <button type="submit" class="primary" id="alarm-settings-save">Save</button>
+    </div>
+  </form>
+</dialog>
+
 <!-- Password -->
 <dialog id="password-dialog">
   <form id="password-form" method="dialog">

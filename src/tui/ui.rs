@@ -15,9 +15,13 @@ const ACCENT: Color = Color::Cyan;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let [header, body, footer] =
-        Layout::vertical([Constraint::Length(1), Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+    let alarm_h = if app.alarms().is_empty() { 0 } else { 1 };
+    let [header, alarm, body, footer] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(alarm_h), Constraint::Fill(1), Constraint::Length(1)]).areas(area);
     draw_header(f, header, app);
+    if alarm_h > 0 {
+        draw_alarm_line(f, alarm, app);
+    }
     draw_footer(f, footer, app);
 
     let n = app.targets().len();
@@ -84,6 +88,46 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Line::from(spans), area);
 }
 
+/// How long ago `ms` was, to the minute once it is over a minute.
+fn alarm_for(since_ms: i64) -> String {
+    let ms = (now_ms() - since_ms).max(0);
+    crate::alarm::dur(if ms >= 60_000 { ms / 60_000 * 60_000 } else { ms })
+}
+
+/// One red line under the header while an alarm is going on.
+fn draw_alarm_line(f: &mut Frame, area: Rect, app: &App) {
+    let alarms = app.alarms();
+    let style = Style::new().fg(Color::White).bg(Color::Red);
+    let text = match alarms {
+        [a] => {
+            let mail = match (a.mail_start_ms, a.mail_note.as_deref()) {
+                (Some(at), _) => format!(" Emailed {}.", util::fmt_local(at, "%H:%M")),
+                (None, Some("off")) => " No email: alarm emails are not set up.".to_string(),
+                _ => String::new(),
+            };
+            format!("{} since {} ({}).{mail}", a.ongoing(), util::fmt_local(a.since_ms, "%H:%M"), alarm_for(a.since_ms))
+        }
+        _ => alarms.iter().map(|a| format!("{} ({})", a.short(), alarm_for(a.since_ms))).collect::<Vec<_>>().join(" · "),
+    };
+    let label = if alarms.len() == 1 { " ALARM ".to_string() } else { format!(" {} ALARMS ", alarms.len()) };
+    let tail = "A alarms ";
+    let room = (area.width as usize).saturating_sub(label.chars().count() + tail.len() + 2);
+    let mut shown: String = text.chars().take(room).collect();
+    if shown.chars().count() < text.chars().count() && room > 1 {
+        shown.pop();
+        shown.push('…');
+    }
+    let pad = room.saturating_sub(shown.chars().count());
+    f.render_widget(
+        Line::from(vec![
+            Span::styled(label, style.bold()),
+            Span::styled(format!(" {shown}{} ", " ".repeat(pad)), style),
+            Span::styled(tail, style),
+        ]),
+        area,
+    );
+}
+
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     if let Some(t) = &app.toast {
         let style = match t.level {
@@ -106,6 +150,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         ("b", "background"),
         ("[ ]", "window"),
         ("← →", "scroll"),
+        ("A", "alarms"),
         ("x", "export"),
         ("w", "web UI"),
         ("?", "help"),
@@ -241,16 +286,18 @@ fn draw_targets(f: &mut Frame, area: Rect, app: &mut App) {
         widths.push(Constraint::Length(spark_w as u16));
     }
 
+    let in_alarm: Vec<i64> = app.alarms().iter().filter_map(|a| a.target_id).collect();
     let rows: Vec<Row> = app
         .targets()
         .iter()
         .map(|t| {
             let s = &t.stats;
             let paused = !t.target.enabled;
+            let alarm = in_alarm.contains(&t.target.id);
             let worst = th.latency(s.avg_ms).max(th.loss(s.loss_pct, s.sent));
             let dot = if paused {
                 Span::styled("◦", Style::new().fg(Color::DarkGray))
-            } else if t.live.error.is_some() && s.received == 0 {
+            } else if alarm || (t.live.error.is_some() && s.received == 0) {
                 Span::styled("!", Style::new().fg(Color::Red).bold())
             } else {
                 Span::styled("●", Style::new().fg(level_color(worst)))
@@ -261,6 +308,8 @@ fn draw_targets(f: &mut Frame, area: Rect, app: &mut App) {
             };
             let (run, run_style) = if paused {
                 ("paused", Style::new().fg(Color::DarkGray))
+            } else if alarm {
+                ("alarm", Style::new().fg(Color::Red).bold())
             } else if local {
                 ("on", Style::new().fg(Color::Green))
             } else if t.target.share_id.is_some() {
@@ -596,11 +645,35 @@ pub fn web_urls(app: &App) -> Vec<String> {
     }
 }
 
+/// The alarms going on, then the latest that ended: (still going, the row).
+fn alarm_rows(list: &crate::alarm::AlarmsList) -> Vec<(bool, String)> {
+    let mut seen = Vec::new();
+    list.now
+        .active
+        .iter()
+        .chain(list.recent.iter())
+        .filter(|a| {
+            let new = !seen.contains(&a.id);
+            seen.push(a.id);
+            new
+        })
+        .map(|a| {
+            let name: String = a.name.chars().take(20).collect();
+            let ended = a.ended_ms.map_or_else(|| "still going".to_string(), |e| util::fmt_local(e, "%H:%M:%S"));
+            let lasted = crate::alarm::dur(a.ended_ms.unwrap_or_else(now_ms) - a.since_ms);
+            (
+                a.ended_ms.is_none(),
+                format!("{name:<20} {:<16} {ended:<12} {lasted:<12} {}", util::fmt_local(a.since_ms, "%d %b %H:%M:%S"), a.what),
+            )
+        })
+        .collect()
+}
+
 fn draw_popup(f: &mut Frame, area: Rect, app: &App) {
     let Some(p) = &app.popup else { return };
     match p {
         Popup::Help => {
-            let r = centered(72, 27, area);
+            let r = centered(72, 29, area);
             f.render_widget(Clear, r);
             let rows: &[(&str, &str)] = &[
                 ("↑ ↓  j k", "select a target (or a hop after Tab)"),
@@ -611,6 +684,8 @@ fn draw_popup(f: &mut Frame, area: Rect, app: &App) {
                 ("space / p", "pause or resume"),
                 ("b", "toggle background: keep running after you quit"),
                 ("B", "move all of this TUI's targets to the background"),
+                ("A", "alarms: what is going on, and the latest"),
+                ("m", "pause the selected target's alarms for 1 hour, or resume"),
                 ("[  ]", "shorter / longer time window (1 min … 30 days)"),
                 ("← →  h l", "scroll back / forward in time"),
                 ("End", "jump back to live"),
@@ -629,7 +704,7 @@ fn draw_popup(f: &mut Frame, area: Rect, app: &App) {
             let w = r.width.saturating_sub(6) as usize;
             for text in [
                 "Colours: green / amber / red by latency and loss thresholds (edit them in pingrail.toml).",
-                "Run: tui = stops when you quit · bg = runs in the background service · link = added through a share link.",
+                "Run: tui = stops when you quit · bg = runs in the background service · link = added through a share link · alarm = an alarm is going on.",
             ] {
                 for l in wrap_words(text, w) {
                     lines.push(Line::from(Span::styled(format!("  {l}"), Style::new().fg(Color::Gray))));
@@ -638,6 +713,47 @@ fn draw_popup(f: &mut Frame, area: Rect, app: &App) {
             lines.push(Line::default());
             lines.push(hint(&[("Esc", "close")]));
             f.render_widget(Paragraph::new(lines).block(popup_block("Keys")), r);
+        }
+        Popup::Alarms(list) => {
+            let rows = list.as_ref().map(alarm_rows).unwrap_or_default();
+            let r = centered(104, (rows.len().min(16) + 9) as u16, area);
+            f.render_widget(Clear, r);
+            let gray = Style::new().fg(Color::Gray);
+            let mut lines: Vec<Line> = Vec::new();
+            match list {
+                None => lines.push(Line::from(Span::styled("  Loading…", gray))),
+                Some(_) if rows.is_empty() => lines.push(Line::from(Span::styled("  No alarms have been raised.", gray))),
+                Some(_) => {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {:<20} {:<16} {:<12} {:<12} {}", "Target", "Started", "Ended", "Lasted", "What"),
+                        gray.bold(),
+                    )));
+                    let room = (r.width as usize).saturating_sub(4);
+                    for (going, text) in rows.into_iter().take(16) {
+                        let text: String = text.chars().take(room).collect();
+                        lines.push(Line::from(Span::styled(format!("  {text}"), if going { Style::new().fg(Color::Red).bold() } else { Style::new() })));
+                    }
+                }
+            }
+            lines.push(Line::default());
+            if let Some(l) = list {
+                let mail = match (&l.now.mail_error, l.now.mail_ready) {
+                    (Some(e), _) => format!("The last alarm email could not be sent: {e}"),
+                    (None, true) => format!("Alarm emails go to {}.", if l.now.recipients == 1 { "1 address".to_string() } else { format!("{} addresses", l.now.recipients) }),
+                    (None, false) => "Alarm emails are not set up yet.".to_string(),
+                };
+                for text in [
+                    mail.as_str(),
+                    "Set the limits, the addresses and the mail server in the web UI: Menu, then Alarms. Here, m pauses the selected target's alarms for an hour.",
+                ] {
+                    for l in wrap_words(text, r.width.saturating_sub(6) as usize) {
+                        lines.push(Line::from(Span::styled(format!("  {l}"), gray)));
+                    }
+                }
+                lines.push(Line::default());
+            }
+            lines.push(hint(&[("Esc", "close")]));
+            f.render_widget(Paragraph::new(lines).block(popup_block("Alarms")), r);
         }
         Popup::Message { title, body, .. } => {
             let lines = body.lines().count() as u16;

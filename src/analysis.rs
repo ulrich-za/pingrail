@@ -200,7 +200,7 @@ pub fn overview_scoped(
         let target = if scope.ids.is_some() { public_target(t) } else { t };
         out.push(TargetOverview { live: live(target.id), target, stats, spark, spark_loss });
     }
-    Ok(Overview { now_ms: now, window_ms, targets: out, thresholds, dns: None })
+    Ok(Overview { now_ms: now, window_ms, targets: out, thresholds, dns: None, alarms: None })
 }
 
 /// Detail for one target. With `hop`, the stats and timeline describe that

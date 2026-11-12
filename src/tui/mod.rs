@@ -122,6 +122,8 @@ pub enum Popup {
     Password(PasswordForm),
     Login(LoginForm),
     Web,
+    /// The alarms going on and the latest; None while they are fetched.
+    Alarms(Option<crate::alarm::AlarmsList>),
     Quit { foreground: usize },
     Message { title: String, body: String, fatal: bool },
 }
@@ -134,6 +136,7 @@ pub enum Msg {
     Heartbeat(Result<bool>),
     TargetSaved(Result<Target>, bool),
     Action(Result<String>),
+    Alarms(Result<crate::alarm::AlarmsList>),
     Exported(Result<Vec<PathBuf>>),
     LoggedIn(Result<()>),
     PasswordSet(Result<()>),
@@ -225,6 +228,16 @@ impl App {
 
     pub fn selected_target(&self) -> Option<&TargetOverview> {
         self.targets().get(self.selected)
+    }
+
+    /// The alarms that are going on, oldest first.
+    pub fn alarms(&self) -> &[crate::alarm::AlarmView] {
+        self.overview.as_ref().and_then(|o| o.alarms.as_ref()).map(|a| a.active.as_slice()).unwrap_or(&[])
+    }
+
+    /// Until when a target's alarms are paused, if they are.
+    pub fn alarms_paused(&self, id: i64) -> Option<i64> {
+        self.overview.as_ref().and_then(|o| o.alarms.as_ref()).and_then(|a| a.paused.get(&id).copied())
     }
 
     pub fn thresholds(&self) -> Thresholds {
@@ -408,6 +421,18 @@ impl App {
                 }
                 self.last_ov = None;
                 self.mark_detail_dirty();
+            }
+            Msg::Alarms(r) => {
+                if matches!(self.popup, Some(Popup::Alarms(_))) {
+                    match r {
+                        Ok(list) => self.popup = Some(Popup::Alarms(Some(list))),
+                        Err(e) if is_unauthorized(&e) => self.need_login(),
+                        Err(e) => {
+                            self.popup = None;
+                            self.toast(ToastLevel::Error, format!("{e:#}"));
+                        }
+                    }
+                }
             }
             Msg::Exported(r) => match r {
                 Ok(paths) => {
@@ -604,6 +629,29 @@ impl App {
         let p = TargetPatch { enabled: Some(!t.enabled), ..Default::default() };
         let msg = if t.enabled { format!("Paused {}", t.name) } else { format!("Resumed {}", t.name) };
         self.spawn(async move { Msg::Action(c.patch_target(t.id, &p).await.map(|_| msg)) });
+    }
+
+    fn open_alarms(&mut self) {
+        self.popup = Some(Popup::Alarms(None));
+        let c = self.client.clone();
+        self.spawn(async move { Msg::Alarms(c.alarms().await) });
+    }
+
+    /// Pause the selected target's alarms for an hour, or switch them on again.
+    fn toggle_alarm_pause(&mut self) {
+        let Some(t) = self.selected_target().map(|t| t.target.clone()) else { return };
+        if t.share_id.is_some() {
+            self.toast(ToastLevel::Warn, "Destinations added through a share link never raise alarms.");
+            return;
+        }
+        let resume = self.alarms_paused(t.id).is_some();
+        let c = self.client.clone();
+        self.spawn(async move {
+            Msg::Action(c.pause_alarms(t.id, if resume { 0 } else { 60 }).await.map(|v| match v.paused_until_ms {
+                Some(until) => format!("Alarms for {} are paused until {}", t.name, util::fmt_local(until, "%H:%M")),
+                None => format!("Alarms for {} are on again", t.name),
+            }))
+        });
     }
 
     fn toggle_background(&mut self) {
@@ -853,6 +901,8 @@ impl App {
                 }
             }
             KeyCode::Char(' ') | KeyCode::Char('p') if n > 0 => self.toggle_pause(),
+            KeyCode::Char('A') => self.open_alarms(),
+            KeyCode::Char('m') if n > 0 => self.toggle_alarm_pause(),
             KeyCode::Char('b') if n > 0 => self.toggle_background(),
             KeyCode::Char('B') if n > 0 => self.all_to_background(),
             KeyCode::Char('[') | KeyCode::Char('-') => self.set_window(self.window.saturating_sub(1)),
@@ -914,6 +964,11 @@ impl App {
             }
             Popup::About => {
                 if matches!(k.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('i')) {
+                    self.popup = None;
+                }
+            }
+            Popup::Alarms(_) => {
+                if matches!(k.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('A')) {
                     self.popup = None;
                 }
             }

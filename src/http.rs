@@ -203,7 +203,14 @@ fn https_location(req: &[u8]) -> Option<String> {
 pub async fn harden(req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     let api = path.starts_with("/api/");
-    let limit = if path.ends_with("/report") { 180 } else { 30 };
+    // Reports take a while; so does a mail server that does not answer.
+    let limit = if path.ends_with("/report") {
+        180
+    } else if path == "/api/alarms/test" {
+        60
+    } else {
+        30
+    };
     let mut resp = match tokio::time::timeout(Duration::from_secs(limit), next.run(req)).await {
         Ok(r) => r,
         Err(_) => (

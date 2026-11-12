@@ -46,9 +46,13 @@ pub struct AppState {
     pub share: crate::share::ShareState,
     /// Proxies whose forwarded-for headers are believed.
     pub trusted: Vec<(IpAddr, u8)>,
+    /// Alarms and their emails (owner only).
+    pub alarms: Arc<crate::alarm::Alarms>,
 }
 
 impl St {
+    // One of each part of the service, handed over once at start.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<Store>,
         engine: Arc<Engine>,
@@ -57,6 +61,7 @@ impl St {
         listen: String,
         certs: Arc<crate::ca::Certs>,
         auth: Arc<crate::auth::Auth>,
+        alarms: Arc<crate::alarm::Alarms>,
     ) -> St {
         let cfg_trusted = cfg.share.trusted_proxies.clone();
         St(Arc::new(AppState {
@@ -71,6 +76,7 @@ impl St {
             certs,
             share: crate::share::ShareState::default(),
             trusted: crate::http::parse_nets(&cfg_trusted),
+            alarms,
         }))
     }
 }
@@ -148,6 +154,12 @@ pub fn router(state: St) -> Router {
         .route("/api/targets", get(list_targets).post(add_target))
         .route("/api/targets/{id}", axum::routing::patch(patch_target).delete(delete_target))
         .route("/api/targets/{id}/detail", get(detail).layer(middleware::from_fn(crate::http::gzip_json)))
+        .route("/api/targets/{id}/alarm", get(target_alarm).put(set_target_alarm))
+        .route("/api/targets/{id}/alarm/pause", post(pause_target_alarms))
+        .route("/api/targets/{id}/alarms", get(target_alarms))
+        .route("/api/alarms", get(alarms))
+        .route("/api/alarms/settings", get(alarm_settings).put(save_alarm_settings))
+        .route("/api/alarms/test", post(test_alarm_mail))
         .route("/api/report", get(report_handler))
         .route("/api/sessions", post(open_session))
         .route("/api/sessions/{id}/heartbeat", post(heartbeat))
@@ -715,6 +727,8 @@ async fn overview(State(st): State<St>, Query(q): Query<OverviewQuery>) -> ApiRe
     })
     .await?;
     ov.dns = st.engine.dns.view();
+    let alarms = st.alarms.clone();
+    ov.alarms = Some(blocking(&st.store, move |s| alarms.now(s)).await?);
     Ok(Json(ov))
 }
 
@@ -773,6 +787,156 @@ async fn delete_target(State(st): State<St>, Path(id): Path<i64>) -> ApiResult<S
     st.engine.sync().await?;
     crate::store::purge_soon(&st.store);
     if ok { Ok(StatusCode::NO_CONTENT) } else { Err(ApiError::not_found()) }
+}
+
+// ----- alarms (owner only: none of this is on the share port) --------------
+
+#[derive(Deserialize)]
+struct LimitQuery {
+    limit: Option<usize>,
+}
+
+async fn alarms(State(st): State<St>, Query(q): Query<LimitQuery>) -> ApiResult<Json<crate::alarm::AlarmsList>> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let a = st.alarms.clone();
+    Ok(Json(blocking(&st.store, move |s| Ok(crate::alarm::AlarmsList { now: a.now(s)?, recent: a.recent(s, None, limit)? })).await?))
+}
+
+async fn target_alarms(State(st): State<St>, Path(id): Path<i64>, Query(q): Query<LimitQuery>) -> ApiResult<Json<Vec<crate::alarm::AlarmView>>> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 500);
+    let a = st.alarms.clone();
+    Ok(Json(blocking(&st.store, move |s| a.recent(s, Some(id), limit)).await?))
+}
+
+async fn target_alarm(State(st): State<St>, Path(id): Path<i64>) -> ApiResult<Json<crate::alarm::TargetAlarmView>> {
+    let v = blocking(&st.store, move |s| if s.get_target(id)?.is_some() { crate::alarm::target_alarm(s, id).map(Some) } else { Ok(None) }).await?;
+    v.map(Json).ok_or_else(ApiError::not_found)
+}
+
+async fn set_target_alarm(
+    State(st): State<St>,
+    Path(id): Path<i64>,
+    Json(alarm): Json<crate::alarm::TargetAlarm>,
+) -> ApiResult<Json<crate::alarm::TargetAlarmView>> {
+    let v = blocking(&st.store, move |s| {
+        // Destinations a share-link visitor added are theirs to watch, not yours to be woken by.
+        let Some(t) = s.get_target(id)? else { return Ok(None) };
+        if t.share_id.is_some() {
+            return Ok(None);
+        }
+        crate::alarm::set_target_alarm(s, id, alarm)?;
+        crate::alarm::target_alarm(s, id).map(Some)
+    })
+    .await?;
+    v.map(Json).ok_or_else(ApiError::not_found)
+}
+
+#[derive(Deserialize)]
+struct PauseRequest {
+    /// Minutes to pause for; absent = until resumed; 0 = resume now.
+    minutes: Option<u32>,
+}
+
+async fn pause_target_alarms(
+    State(st): State<St>,
+    Path(id): Path<i64>,
+    Json(req): Json<PauseRequest>,
+) -> ApiResult<Json<crate::alarm::TargetAlarmView>> {
+    let v = blocking(&st.store, move |s| {
+        if s.get_target(id)?.is_none() {
+            return Ok(None);
+        }
+        crate::alarm::pause_target(s, id, req.minutes)?;
+        crate::alarm::target_alarm(s, id).map(Some)
+    })
+    .await?;
+    v.map(Json).ok_or_else(ApiError::not_found)
+}
+
+/// The alarm settings as the form shows them. The mail password is never
+/// sent back, only whether one is saved.
+#[derive(serde::Serialize)]
+struct AlarmSettingsView {
+    #[serde(flatten)]
+    settings: crate::alarm::Settings,
+    password_set: bool,
+}
+
+/// The form as it comes in: the addresses as typed, and the password only
+/// when a new one was typed.
+#[derive(Deserialize)]
+struct AlarmSettingsForm {
+    #[serde(default)]
+    to: String,
+    #[serde(default)]
+    limits: crate::alarm::Limits,
+    unstable_count: Option<u32>,
+    unstable_min: Option<u32>,
+    #[serde(default)]
+    remind: crate::alarm::Remind,
+    #[serde(default)]
+    mail: crate::mail::MailServer,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+impl AlarmSettingsForm {
+    fn settings(&self) -> ApiResult<crate::alarm::Settings> {
+        let to = crate::mail::parse_recipients(&self.to).map_err(|bad| ApiError::bad(format!("“{bad}” is not an email address.")))?;
+        let d = crate::alarm::Settings::default();
+        let mut mail = self.mail.clone();
+        // "smtp.example.com:2525" for a server on a port of its own.
+        if let Some((host, port)) = mail.host.trim().rsplit_once(':')
+            && !host.contains(':')
+            && let Ok(port) = port.parse::<u16>()
+        {
+            mail.port = port;
+            mail.host = host.to_string();
+        }
+        Ok(crate::alarm::Settings {
+            to,
+            limits: self.limits,
+            unstable_count: self.unstable_count.unwrap_or(d.unstable_count),
+            unstable_min: self.unstable_min.unwrap_or(d.unstable_min),
+            remind: self.remind,
+            mail,
+        })
+    }
+
+    /// The password typed, if one was.
+    fn new_password(&self) -> Option<String> {
+        self.password.clone().filter(|p| !p.is_empty())
+    }
+}
+
+async fn alarm_settings(State(st): State<St>) -> ApiResult<Json<AlarmSettingsView>> {
+    let a = st.alarms.clone();
+    Ok(Json(tokio::task::spawn_blocking(move || AlarmSettingsView { settings: a.settings(), password_set: a.password_set() }).await.map_err(anyhow::Error::from)?))
+}
+
+async fn save_alarm_settings(State(st): State<St>, Json(form): Json<AlarmSettingsForm>) -> ApiResult<Json<AlarmSettingsView>> {
+    let settings = form.settings()?;
+    let password = form.new_password();
+    let a = st.alarms.clone();
+    let saved = tokio::task::spawn_blocking(move || a.save(settings, password).map(|s| AlarmSettingsView { settings: s, password_set: a.password_set() }))
+        .await
+        .map_err(anyhow::Error::from)?;
+    saved.map(Json).map_err(ApiError::bad)
+}
+
+#[derive(serde::Serialize)]
+struct TestResult {
+    ok: bool,
+    text: String,
+}
+
+/// Send a test email with what is in the form, saved or not.
+async fn test_alarm_mail(State(st): State<St>, Json(form): Json<AlarmSettingsForm>) -> ApiResult<Json<TestResult>> {
+    let settings = form.settings()?;
+    Ok(Json(match st.alarms.test(settings, form.new_password()).await {
+        Ok(text) => TestResult { ok: true, text },
+        Err(text) => TestResult { ok: false, text },
+    }))
 }
 
 #[derive(Deserialize)]

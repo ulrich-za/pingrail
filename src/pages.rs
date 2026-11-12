@@ -278,6 +278,9 @@ mod tests {
             ] {
                 assert!(!html.contains(admin_only), "share page {v:?} contains {admin_only}");
             }
+            // Alarms are the owner's alone: a share page carries no trace of them.
+            assert!(!html.to_lowercase().contains("alarm"), "share page {v:?} mentions alarms");
+            assert!(!js.to_lowercase().contains("alarm"), "share script {v:?} mentions alarms");
             for admin_code in [
                 "/auth/", "authCall", "AUTH_WORDS", "/api/ping", "/api/password", "/api/shares", "/api/me", "Login.show",
                 "onShareSave", "/api/passkey", "/api/certificate", "/api/qr", "navigator.credentials", "onPhoneName",
@@ -304,7 +307,18 @@ mod tests {
         for visitor_code in ["/api/s/", "showVisitor", "applyVisit", "isOwned"] {
             assert!(!p.admin_js.contains(visitor_code), "admin script contains {visitor_code}");
         }
-        for admin_has in ["login-form", "target-dialog", "export-dialog", "onTargetSave", "onExport", "Login.show"] {
+        for admin_has in [
+            "login-form",
+            "target-dialog",
+            "export-dialog",
+            "onTargetSave",
+            "onExport",
+            "Login.show",
+            "alarm-settings-dialog",
+            "alarm-banner",
+            "openAlarmSettings",
+            "/api/alarms/settings",
+        ] {
             assert!(p.admin_html.contains(admin_has) || p.admin_js.contains(admin_has), "admin page lacks {admin_has}");
         }
         assert!(p.admin_html.contains(r#"src="/app.js""#));

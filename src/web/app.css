@@ -721,6 +721,26 @@ label.check { display: flex; gap: 0.5rem; align-items: center; color: var(--ink)
   padding: 0.55rem var(--pad-r) 0.55rem var(--pad-l); font-size: 0.9rem; font-weight: 600;
 }
 
+/* Alarms: the banner under the top bar while one is going on. The red is
+   the loss red, so the mark is always a diamond as well: never colour alone. */
+.alarm-banner {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 1rem;
+  background: var(--crit); color: var(--on-crit);
+  padding: 0.5rem var(--pad-r) 0.5rem var(--pad-l); font-size: 0.95rem;
+}
+.alarm-banner p { margin: 0; flex: 1 1 22rem; font-weight: 560; }
+.alarm-banner button { border-color: var(--on-crit); color: var(--on-crit); font-size: 0.875rem; font-weight: 560; padding: 0.35rem 0.75rem; min-height: 36px; }
+@media (hover: hover) {
+  .alarm-banner button:not(:disabled):hover { background: var(--on-crit); color: var(--crit); }
+}
+.alarm-banner button:focus-visible { outline-color: var(--on-crit); }
+.alarm-mark {
+  display: inline-block; flex: none; width: 9px; height: 9px;
+  background: var(--crit); outline: 1px solid var(--edge); transform: rotate(45deg);
+}
+.alarms-open { display: inline-flex; align-items: center; gap: 0.5rem; }
+.alarms-n { font-family: var(--mono); font-size: 0.8rem; }
+
 .layout {
   flex: 1;
   display: grid;
@@ -762,6 +782,8 @@ label.check { display: flex; gap: 0.5rem; align-items: center; color: var(--ink)
 .target-list .host { grid-area: host; font-size: 0.8rem; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .target-list canvas { grid-area: spark; width: 72px; height: 18px; }
 .target-list .paused .name, .target-list .paused .ms { color: var(--ink-3); font-weight: 400; }
+.target-list .alarm .dot { background: var(--crit) !important; border: 0; outline: 1px solid var(--edge); transform: rotate(45deg); }
+.target-list .alarm .host { color: var(--ink); }
 .target-list button[aria-current="true"] :is(.name, .ms) { color: var(--ink); }   /* ink-3 drops to 4.1:1 on the selected fill */
 .target-list .group { font-size: 0.72rem; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; padding: 0.7rem 0.6rem 0.2rem; font-weight: 600; }
 .dot.good { background: var(--good) !important; }
@@ -828,6 +850,12 @@ label.check { display: flex; gap: 0.5rem; align-items: center; color: var(--ink)
 }
 .event-mark:hover::before, .event-mark:focus-visible::before { border-bottom-color: var(--ink-2); }
 .event-mark:focus-visible { outline-offset: 1px; }
+/* An alarm was raised here: a red diamond instead of the triangle. */
+.event-mark.is-urgent::before {
+  left: 7px; top: 1px; width: 10px; height: 10px; border: 0;
+  background: var(--crit); outline: 1px solid var(--edge); transform: rotate(45deg);
+}
+.event-mark.is-urgent:hover::before, .event-mark.is-urgent:focus-visible::before { outline-width: 2px; }
 .tooltip .r { display: flex; justify-content: space-between; gap: 1rem; }
 .tooltip strong { font-family: var(--mono); font-weight: 400; font-size: 0.95em; }
 .legend { font-size: 0.8rem; display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap; }
@@ -839,7 +867,20 @@ label.check { display: flex; gap: 0.5rem; align-items: center; color: var(--ink)
 .legend.is-unanswered .key-loss { background: var(--ink-3); outline-color: transparent; }
 .key-gap { width: 14px; height: 9px; background: var(--gap); border: 1px solid var(--line); margin-left: 0.6rem; }
 .key-mark { width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent; border-bottom: 8px solid var(--ink); margin-left: 0.6rem; }
+.legend .alarm-mark { margin: 0 0.15rem 0 0.75rem; }
 #chart-caption { margin-top: -0.6rem; }
+
+/* A target's alarms: the line under its name, the table under its graphs. */
+.t-alarm { color: var(--ink-2); font-size: 0.9rem; }
+.t-alarm.is-on { color: var(--ink); border-left: 4px solid var(--crit); padding-left: 0.6rem; }
+.t-alarms { display: grid; gap: 0.4rem; margin-top: 0.6rem; }
+.table-scroll { overflow-x: auto; }
+#alarms-dialog { width: min(860px, calc(100vw - 2rem)); }
+.alarm-table thead th { border-bottom: var(--rail) solid var(--ink); }
+.alarm-table td { height: 38px; border-bottom: 1px solid var(--line); }
+.alarm-table td.what { white-space: normal; min-width: 11rem; }
+.alarm-table tr.going td { font-weight: 640; }
+.alarm-table tr.going td:first-child { box-shadow: inset 4px 0 0 var(--crit); }
 
 /* What the stats describe: pings to the destination, or trace probes to the
    hop being graphed. Always one line high on wide screens, so picking a hop
@@ -1044,6 +1085,20 @@ input.tiny { width: 4.6rem; padding: 0.3rem 0.45rem; }
 .limits label { color: var(--ink); }
 .limits .unit { display: flex; align-items: center; gap: 0.4rem; color: var(--ink-2); }
 .warn-note { color: var(--attn-ink); background: var(--attn); padding: 0.55rem 0.7rem; }
+
+/* Alarm rules: a sentence per rule, with its numbers in place. */
+.rules { display: grid; gap: 0.6rem; }
+.rules[hidden] { display: none; }
+.rules > p { margin: 0; font-size: 0.9rem; color: var(--ink-2); }
+.rule { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem 0.5rem; font-size: 0.9rem; color: var(--ink); }
+.rule label.check { font-size: 0.9rem; }
+.rule-set { gap: 0.6rem; padding-top: 0.9rem; border-top: 1px solid var(--line); }
+.mail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.6rem 1rem; align-items: start; }
+.field-like { display: grid; gap: 0.3rem; font-size: 0.9rem; color: var(--ink-2); font-weight: 560; }
+.test-result { font-size: 0.9rem; flex: 1 1 14rem; }
+.test-result.ok::before, .test-result.bad::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 0.5em; outline: 1px solid var(--edge); }
+.test-result.ok::before { background: var(--good); }
+.test-result.bad::before { background: var(--crit); }
 .warn-note code { font-size: 0.82rem; }
 
 .share-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.6rem; }

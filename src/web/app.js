@@ -276,6 +276,8 @@ const S = {
   sharesAt: 0,
   shareEditing: null,   // share being edited in the dialog
   cert: null,           // /api/certificate response
+  alarmLog: null,       // { id, at, key, rows }: the selected target's alarms
+  alarmForm: null,      // what the target dialog loaded, to save only a change
   /*@end*/
 };
 
@@ -1302,7 +1304,13 @@ async function refresh() {
       const ids = ov.targets.map((t) => t.target.id);
       if (!ids.includes(S.selected)) S.selected = ids[0] ?? null;
       renderList();
+      /*@admin*/
+      renderAlarms();
+      /*@end*/
     }
+    /*@admin*/
+    maybeLoadAlarmLog();
+    /*@end*/
     setConn('ok');
     if (S.selected !== null) {
       const key = viewKey();
@@ -1427,13 +1435,20 @@ function renderList() {
     $('.name', b).textContent = t.target.name;
     $('.ms', b).textContent = paused ? 'paused' : (s.cur_ms === null ? (s.sent ? 'lost' : '—') : `${fmtMs(s.cur_ms)} ms`);
     let host = t.live.ip && t.live.ip !== t.target.host ? `${t.target.host} (${t.live.ip})` : t.target.host;
+    let extra = '';   // more to say about this target, for screen readers too
     /*@admin*/
     if (t.target.share_id) host += ` · via ${shareLabel(t.target.share_id)}`;
+    const on = alarmsFor(t.target.id);
+    if (on.length) {
+      extra = `alarm, ${fmtFor(Date.now() - on[0].since_ms)}`;
+      host += ` · ${extra}`;
+    }
+    b.classList.toggle('alarm', on.length > 0);
     /*@end*/
     $('.host', b).textContent = host;
     b.classList.toggle('paused', paused);
     b.setAttribute('aria-current', t.target.id === S.selected ? 'true' : 'false');
-    b.setAttribute('aria-label', `${t.target.name}, ${paused ? 'paused' : `${fmtMs(s.avg_ms)} ms average, ${fmtPct(s.loss_pct)}% loss`}`);
+    b.setAttribute('aria-label', `${t.target.name}, ${paused ? 'paused' : `${fmtMs(s.avg_ms)} ms average, ${fmtPct(s.loss_pct)}% loss`}${extra ? `, ${extra}` : ''}`);
     drawSpark($('canvas', b), t);
   }
   $('#empty').hidden = targets.length > 0;
@@ -1544,6 +1559,7 @@ function renderDetail() {
   /*@end*/
   /*@admin*/
   $('#t-bg').hidden = !(t.enabled && t.session);
+  renderTargetAlarm(t);
   /*@end*/
   const err = $('#t-error');
   err.hidden = !ov.live.error;
@@ -1753,7 +1769,11 @@ function drawCharts() {
 /** The target's events in view, those within a few pixels sharing a mark. */
 function markGroups(d, from, to, pw) {
   const groups = [];
-  for (const e of (d && d.events) || []) {
+  let events = (d && d.events) || [];
+  /*@admin*/
+  events = withAlarmMarks(d, events);
+  /*@end*/
+  for (const e of events) {
     if (e.ts_ms < from || e.ts_ms > to) continue;
     const x = xAt(e.ts_ms, from, to, pw);
     const last = groups[groups.length - 1];
@@ -1768,11 +1788,14 @@ function drawMarkLines(g, d, from, to, pw, top, bottom) {
   const groups = markGroups(d, from, to, pw);
   if (!groups.length) return;
   g.save();
-  g.strokeStyle = css('--ink');
   g.globalAlpha = 0.6;
   g.lineWidth = 1;
-  g.setLineDash([2, 3]);
   for (const m of groups) {
+    // A mark that calls for attention is drawn in the loss red.
+    const urgent = m.events.some((e) => e.urgent);
+    g.strokeStyle = css(urgent ? '--crit' : '--ink');
+    g.globalAlpha = urgent ? 1 : 0.6;
+    g.setLineDash(urgent ? [5, 3] : [2, 3]);
     const xx = Math.round(m.x) + 0.5;
     g.beginPath(); g.moveTo(xx, top); g.lineTo(xx, bottom); g.stroke();
   }
@@ -1784,6 +1807,9 @@ const fmtAddr = (a) => a || 'an unknown address';
 /** One event in a sentence (for screen readers and the mark's label). */
 function eventText(e, host) {
   if (e.kind === 'address') return `${host} changed address from ${fmtAddr(e.from)} to ${fmtAddr(e.to)}`;
+  /*@admin*/
+  if (e.kind === 'alarm') return `alarm raised: ${e.alarm.what}`;
+  /*@end*/
   return e.kind;
 }
 
@@ -1799,13 +1825,13 @@ function placeMarks(d) {
   const cv = $('#chart');
   const [from, to] = chartRange();
   const groups = markGroups(d, from, to, cv.clientWidth - PAD.l - PAD.r);
-  const key = groups.map((m) => m.events.map((e) => e.ts_ms).join('+')).join(',');
+  const key = groups.map((m) => m.events.map((e) => `${e.kind[0]}${e.ts_ms}${e.over ? 'e' : ''}`).join('+')).join(',');
   if (box.dataset.key !== key) {
     // New marks (the same ones only move, keeping focus).
     const host = d ? d.target.host : '';
     box.replaceChildren(...groups.map((m) => {
       const label = m.events.map((e) => `${eventTime(e)}: ${eventText(e, host)}`).join('; ');
-      const b = el('button', { type: 'button', class: 'event-mark', 'aria-label': label });
+      const b = el('button', { type: 'button', class: m.events.some((e) => e.urgent) ? 'event-mark is-urgent' : 'event-mark', 'aria-label': label });
       const show = () => showMarkTip(b, m.events, host);
       b.addEventListener('mouseenter', show);
       b.addEventListener('focus', show);
@@ -1831,6 +1857,14 @@ function showMarkTip(b, events, host) {
   const rows = [];
   for (const e of events.slice(-4)) {
     rows.push(el('div', { class: 't', text: eventTime(e) }));
+    /*@admin*/
+    if (e.kind === 'alarm') {
+      const a = e.alarm;
+      rows.push(el('p', { class: 'what', text: 'Alarm raised' }));
+      rows.push(r('What', a.what), r('Since', timeSecFmt.format(a.since_ms)), r('Ended', a.ended_ms ? timeSecFmt.format(a.ended_ms) : 'still going'));
+      continue;
+    }
+    /*@end*/
     if (e.kind === 'address') {
       rows.push(el('p', { class: 'what', text: `${host} changed address` }));
       rows.push(r('From', fmtAddr(e.from)), r('To', fmtAddr(e.to)));
@@ -1841,7 +1875,7 @@ function showMarkTip(b, events, host) {
       rows.push(el('p', { class: 'what', text: e.kind }));
     }
   }
-  if (events.length > 4) rows.unshift(el('p', { class: 'what', text: `${events.length} changes here; the last 4:` }));
+  if (events.length > 4) rows.unshift(el('p', { class: 'what', text: `${events.length} marks here; the last 4:` }));
   tip.replaceChildren(...rows);
   tip.hidden = false;
   // Beside the mark's line, at the top of the chart, so the change in the
@@ -1860,7 +1894,10 @@ function showMarkTip(b, events, host) {
 
 function updateLegend(d) {
   const samples = !d || d.timeline.mode === 'samples';
-  $('#legend-mark').hidden = !$('#marks').children.length;
+  $('#legend-mark').hidden = !$('#marks .event-mark:not(.is-urgent)');
+  /*@admin*/
+  $('#legend-alarm').hidden = !$('#marks .is-urgent');
+  /*@end*/
   $('#legend-avg').textContent = samples ? 'moving average' : 'average';
   $('#legend-spread').textContent = samples ? 'each sample' : 'lowest to highest';
   $('#legend-spread-key').className = samples ? 'key-sample' : 'key-band';
@@ -2501,6 +2538,9 @@ function openTargetDialog(target, preset) {
   field(f, 'trace').checked = target ? target.trace : true;
   $('#target-error').textContent = '';
   $('.hint', f).hidden = !!target;
+  /*@admin*/
+  loadTargetAlarm(target);
+  /*@end*/
   dlg.showModal();
   (target ? field(f, 'name') : field(f, 'host')).focus();
 }
@@ -2521,6 +2561,9 @@ async function onTargetSave(ev) {
     let t;
     if (S.editing) {
       t = await api(targetPath(S.editing), { method: 'PATCH', json: { name: field(f, 'name').value, interval_ms: Math.round(interval * 1000), trace: field(f, 'trace').checked } });
+      /*@admin*/
+      await saveTargetAlarm(t.id);
+      /*@end*/
       toast(`Saved ${t.name}`);
     } else {
       t = await api(targetPath(), { json: { host: field(f, 'host').value.trim(), name: field(f, 'name').value.trim() || null, interval_ms: Math.round(interval * 1000), trace: field(f, 'trace').checked } });
@@ -3292,6 +3335,375 @@ async function onShareSave(ev) {
     btn.disabled = false;
   }
 }
+
+// ----- alarms --------------------------------------------------------------------
+
+/** What the service says about alarms right now (with every overview). */
+const alarmsNow = () => S.overview?.alarms || { active: [], paused: {}, mail_ready: false, recipients: 0 };
+const alarmsFor = (id) => alarmsNow().active.filter((a) => a.target_id === id);
+/** Until when a target's alarms are paused (ms), if they are. */
+const alarmsPaused = (id) => (alarmsNow().paused || {})[id] || null;
+
+/** How long something has gone on, to the minute: "40 s", "12 min", "2 h 5 min", "3 days". */
+function fmtFor(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s} s`;
+  if (s < 3600) return `${Math.floor(s / 60)} min`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h${s % 3600 >= 60 ? ` ${Math.floor((s % 3600) / 60)} min` : ''}`;
+  const d = Math.floor(s / 86400);
+  return `${d} day${d === 1 ? '' : 's'}${s % 86400 >= 3600 ? ` ${Math.floor((s % 86400) / 3600)} h` : ''}`;
+}
+
+/** The same to the second while it is short: "12 min 4 s". */
+function fmtLasted(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60 || s >= 3600) return fmtFor(ms);
+  return `${Math.floor(s / 60)} min${s % 60 ? ` ${s % 60} s` : ''}`;
+}
+
+/** A time today as 13:53, another day as 10 Nov 13:53. */
+function fmtAt(ms, secs) {
+  const today = new Date(ms).toDateString() === new Date().toDateString();
+  if (today) return (secs ? timeSecFmt : timeFmt).format(ms);
+  return secs ? `${dayFmt.format(ms)} ${timeSecFmt.format(ms)}` : dayTimeFmt.format(ms);
+}
+
+const ALARM_NOW = {
+  down: (a) => `${a.name} has not answered since ${fmtAt(a.since_ms)}.`,
+  loss: (a) => `${a.name} has been losing pings since ${fmtAt(a.since_ms)}.`,
+  slow: (a) => `${a.name} has been slow since ${fmtAt(a.since_ms)}.`,
+  cutoff: (a) => `No target has answered since ${fmtAt(a.since_ms)}: ${a.name} looks cut off from them.`,
+  internet: (a) => `Nothing beyond this network has answered since ${fmtAt(a.since_ms)}: the internet connection at ${a.name} looks down.`,
+};
+const ALARM_SHORT = {
+  down: (a) => `${a.name} is not answering`,
+  loss: (a) => `${a.name} is losing pings`,
+  slow: (a) => `${a.name} is slow`,
+  cutoff: (a) => `${a.name} is cut off`,
+  internet: () => 'the internet connection is down',
+};
+const ALARM_STATE = { down: 'not answering', loss: 'losing pings', slow: 'slow', cutoff: 'cut off', internet: 'internet connection down' };
+
+/** What became of the email for an alarm that is still going. */
+function alarmMailNow(a, now) {
+  if (a.mail_start_ms) {
+    const n = now.recipients;
+    return `An email went to ${n} address${n === 1 ? '' : 'es'} at ${fmtAt(a.mail_start_ms)}.`;
+  }
+  if (a.mail_note === 'off') return 'No email was sent: alarm emails are not set up.';
+  if (a.mail_note === 'unstable') return 'No email for each drop: this target is unstable.';
+  if (now.mail_error) return `The email has not gone out yet. ${cap(now.mail_error)}`;
+  return 'An email is on its way.';
+}
+
+/** The Email column of an alarm in a table. */
+function alarmMailText(a) {
+  if (a.mail_start_ms && a.mail_end_ms) {
+    const [start, end] = [fmtAt(a.mail_start_ms), fmtAt(a.mail_end_ms)];
+    return start === end ? `sent ${start} (start and end)` : `sent ${start} and ${end}`;
+  }
+  if (a.mail_start_ms) {
+    const sent = `sent ${fmtAt(a.mail_start_ms)}`;
+    if (!a.ended_ms) return sent;
+    // Stopped by hand (alarms paused, a rule switched off): no email for the end.
+    return a.mail_note === 'stopped' ? `${sent}; none for the end` : a.mail_note ? sent : `${sent}; the end is waiting`;
+  }
+  if (a.mail_end_ms) return `sent ${fmtAt(a.mail_end_ms)}`;
+  if (a.mail_note === 'off') return 'not sent: not set up';
+  if (a.mail_note === 'unstable') return 'held back: unstable';
+  if (a.mail_note === 'stopped') return 'none';
+  return 'waiting to be sent';
+}
+
+/** The banner under the top bar and the Alarms button in it. */
+function renderAlarms() {
+  const now = alarmsNow();
+  const on = now.active;
+  const open = $('#alarms-open');
+  open.hidden = on.length === 0;
+  $('#alarms-n').textContent = on.length;
+  const banner = $('#alarm-banner');
+  banner.hidden = on.length === 0;
+  if (!on.length) return;
+  const show = $('#alarm-banner-show');
+  const pause = $('#alarm-banner-pause');
+  let text;
+  if (on.length === 1) {
+    const a = on[0];
+    text = `${(ALARM_NOW[a.kind] || ALARM_NOW.down)(a)} That is ${fmtFor(Date.now() - a.since_ms)}. ${alarmMailNow(a, now)}`;
+    show.textContent = a.target_id === null ? 'Show alarms' : `Show ${a.name}`;
+    pause.hidden = a.target_id === null;
+    pause.textContent = 'Pause its alarms for 1 hour';
+  } else {
+    const first = on.slice(0, 3).map((a) => `${(ALARM_SHORT[a.kind] || ALARM_SHORT.down)(a)} (${fmtFor(Date.now() - a.since_ms)})`);
+    text = `${on.length} alarms: ${first.join(', ')}${on.length > 3 ? `, and ${on.length - 3} more` : ''}.`;
+    show.textContent = 'Show alarms';
+    pause.hidden = true;
+  }
+  $('#alarm-banner-text').textContent = text;
+}
+
+function onBannerShow() {
+  const on = alarmsNow().active;
+  if (on.length === 1 && on[0].target_id !== null) select(on[0].target_id);
+  else openAlarms();
+}
+
+/** Pause a target's alarms for some minutes (0 resumes them). */
+async function pauseAlarms(id, minutes) {
+  const name = targetName(id) || 'this target';
+  try {
+    const v = await api(`/api/targets/${id}/alarm/pause`, { json: { minutes } });
+    toast(minutes ? `Alarms for ${name} are paused until ${fmtAt(v.paused_until_ms)}` : `Alarms for ${name} are on again`);
+    listChanged();
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+/** The alarm line under a target's name, and its pause button. */
+function renderTargetAlarm(t) {
+  const now = alarmsNow();
+  const line = $('#t-alarm');
+  const btn = $('#t-alarm-pause');
+  const on = alarmsFor(t.id);
+  const until = alarmsPaused(t.id);
+  // Destinations a visitor added never raise alarms.
+  btn.hidden = !!t.share_id;
+  btn.textContent = until ? 'Resume alarms' : 'Pause alarms';
+  line.classList.toggle('is-on', on.length > 0);
+  if (on.length) {
+    line.replaceChildren(...on.flatMap((a, i) => [
+      i ? el('br') : null,
+      el('strong', { text: `Alarm: ${ALARM_STATE[a.kind] || a.kind} for ${fmtLasted(Date.now() - a.since_ms)}` }),
+      ` since ${fmtAt(a.since_ms, true)}. ${a.mail_start_ms ? `Emailed at ${fmtAt(a.mail_start_ms, true)}.` : alarmMailNow(a, now)}`,
+    ]).filter((x) => x !== null));
+  } else if (until) {
+    line.textContent = `Alarms for this target are paused until ${fmtAt(until)}.`;
+  }
+  line.hidden = !on.length && !until;
+  renderAlarmLog();
+}
+
+/** Fetch the selected target's alarms when the target changes, when one of
+ *  its alarms starts or ends, and now and then. */
+function maybeLoadAlarmLog() {
+  const id = S.selected;
+  if (id === null) { S.alarmLog = null; return; }
+  const key = `${id}:${alarmsFor(id).map((a) => a.id).join(',')}`;
+  const log = S.alarmLog;
+  if (log && log.key === key && Date.now() - log.at < 30000) return;
+  if (!log || log.id !== id) S.alarmLog = { id, key, at: Date.now(), rows: [] };
+  else { log.key = key; log.at = Date.now(); }
+  api(`/api/targets/${id}/alarms`).then((rows) => {
+    if (S.alarmLog && S.alarmLog.id === id) {
+      S.alarmLog.rows = rows;
+      if (S.selected === id) { renderAlarmLog(); drawCharts(); }
+    }
+  }).catch(() => { if (S.alarmLog) S.alarmLog.at = 0; });
+}
+
+function alarmRow(a, withTarget) {
+  const going = !a.ended_ms;
+  return el('tr', { class: going ? 'going' : null },
+    withTarget ? el('td', { text: a.name }) : null,
+    el('td', { text: `${dayFmt.format(a.since_ms)} ${timeSecFmt.format(a.since_ms)}` }),
+    el('td', { text: going ? 'still going' : fmtAt(a.ended_ms, true) }),
+    withTarget ? null : el('td', { text: fmtLasted((a.ended_ms || Date.now()) - a.since_ms) }),
+    el('td', { class: 'what', text: a.what }),
+    withTarget ? null : el('td', { class: 'num', text: a.lost === undefined || a.lost === null ? '' : a.lost.toLocaleString() }),
+    el('td', { class: 'what', text: alarmMailText(a) }));
+}
+
+/** The table of the selected target's alarms under its graphs. */
+function renderAlarmLog() {
+  const rows = S.alarmLog && S.alarmLog.id === S.selected ? S.alarmLog.rows : [];
+  $('#t-alarms').hidden = rows.length === 0;
+  if (rows.length) $('#t-alarms-rows').replaceChildren(...rows.map((a) => alarmRow(a, false)));
+}
+
+/** The selected target's alarms in view, as marks for the time axis. */
+function withAlarmMarks(d, events) {
+  const log = S.alarmLog;
+  if (!d || !log || log.id !== d.target.id || !log.rows.length) return events;
+  const marks = log.rows.map((a) => ({ kind: 'alarm', ts_ms: a.raised_ms, alarm: a, urgent: true, over: !!a.ended_ms }));
+  return [...events, ...marks].sort((a, b) => a.ts_ms - b.ts_ms);
+}
+
+/** Every alarm that is going on, and the latest that ended. */
+async function openAlarms() {
+  closeMenu();
+  const dlg = $('#alarms-dialog');
+  $('#alarms-rows').replaceChildren();
+  $('#alarms-empty').hidden = true;
+  $('#alarms-mail').textContent = '';
+  dlg.showModal();
+  try {
+    const v = await api('/api/alarms');
+    const seen = new Set();
+    const rows = [...v.now.active, ...v.recent].filter((a) => !seen.has(a.id) && seen.add(a.id));
+    $('#alarms-rows').replaceChildren(...rows.map((a) => alarmRow(a, true)));
+    $('#alarms-empty').hidden = rows.length > 0;
+    $('.table-scroll', dlg).hidden = rows.length === 0;
+    const n = v.now.recipients;
+    $('#alarms-mail').textContent = v.now.mail_error
+      ? `The last alarm email could not be sent. ${cap(v.now.mail_error)} pingrail keeps trying.`
+      : v.now.mail_ready
+        ? `Alarm emails go to ${n} address${n === 1 ? '' : 'es'}.`
+        : 'Alarm emails are not set up yet. Alarms still show here and on the graphs.';
+  } catch (e) {
+    $('#alarms-mail').textContent = e.message;
+  }
+}
+
+const LIMIT_NUMBERS = { down_s: [5, 86400, 30], loss_pct: [0.01, 100, 2], loss_min: [1, 1440, 5], slow_ms: [1, 60000, 150], slow_min: [1, 1440, 5] };
+
+function fillLimits(f, l) {
+  for (const k of ['down', 'loss', 'slow']) field(f, k).checked = !!l[k];
+  for (const k of Object.keys(LIMIT_NUMBERS)) field(f, k).value = l[k];
+}
+
+function readLimits(f) {
+  const l = {};
+  for (const k of ['down', 'loss', 'slow']) l[k] = field(f, k).checked;
+  for (const [k, [lo, hi, dflt]] of Object.entries(LIMIT_NUMBERS)) l[k] = clampNum(field(f, k).value, lo, hi, dflt);
+  return l;
+}
+
+/** The limits in a sentence, for the hint under "The general limits". */
+function limitsText(l) {
+  const parts = [];
+  if (l.down) parts.push(`not answering for ${l.down_s} s`);
+  if (l.loss) parts.push(`more than ${l.loss_pct} % lost over ${l.loss_min} min`);
+  if (l.slow) parts.push(`slower than ${l.slow_ms} ms for ${l.slow_min} min`);
+  return parts.length ? `The general limits now: ${parts.join('; ')}.` : 'Every general rule is switched off, so this target raises no alarm.';
+}
+
+/** The Alarms part of the target dialog: only for a target that exists and
+ *  that the owner added. */
+async function loadTargetAlarm(target) {
+  const box = $('#target-alarm');
+  const f = $('#target-form');
+  S.alarmForm = null;
+  box.hidden = true;
+  // Room for a rule on one line.
+  $('#target-dialog').classList.toggle('wide', !!target && !target.share_id);
+  if (!target || target.share_id) return;
+  try {
+    const v = await api(`/api/targets/${target.id}/alarm`);
+    if (S.editing !== target.id) return;
+    setRadio(f, 'alarm_mode', v.mode);
+    fillLimits(f, v.mode === 'own' ? v : v.general);
+    $('#target-alarm-general').textContent = limitsText(v.general);
+    S.alarmForm = JSON.stringify(readTargetAlarm());
+    syncTargetAlarm();
+    box.hidden = false;
+  } catch (_) { /* the rest of the dialog still works */ }
+}
+
+function readTargetAlarm() {
+  const f = $('#target-form');
+  const mode = radio(f, 'alarm_mode') || 'general';
+  return mode === 'own' ? { mode, ...readLimits(f) } : { mode };
+}
+
+function syncTargetAlarm() {
+  const mode = radio($('#target-form'), 'alarm_mode');
+  $('#target-alarm-own').hidden = mode !== 'own';
+  $('#target-alarm-general').hidden = mode !== 'general';
+}
+
+async function saveTargetAlarm(id) {
+  if (S.alarmForm === null) return;
+  const v = readTargetAlarm();
+  if (JSON.stringify(v) === S.alarmForm) return;
+  await api(`/api/targets/${id}/alarm`, { method: 'PUT', json: v });
+}
+
+/** What is in the settings form, as the service takes it. */
+function readAlarmSettings() {
+  const f = $('#alarm-settings-form');
+  return {
+    to: field(f, 'to').value,
+    limits: readLimits(f),
+    unstable_count: clampInt(field(f, 'unstable_count').value, 1, 100, 3),
+    unstable_min: clampInt(field(f, 'unstable_min').value, 1, 1440, 15),
+    remind: radio(f, 'remind') || 'never',
+    mail: {
+      host: field(f, 'host').value.trim(),
+      security: radio(f, 'security') || 'tls',
+      username: field(f, 'username').value.trim(),
+      from: field(f, 'from').value.trim(),
+    },
+    password: field(f, 'password').value,
+  };
+}
+
+function fillAlarmSettings(v) {
+  const f = $('#alarm-settings-form');
+  field(f, 'to').value = v.to.join(', ');
+  fillLimits(f, v.limits);
+  field(f, 'unstable_count').value = v.unstable_count;
+  field(f, 'unstable_min').value = v.unstable_min;
+  setRadio(f, 'remind', v.remind);
+  const usual = v.mail.security === 'starttls' ? 587 : 465;
+  field(f, 'host').value = v.mail.host + (v.mail.port && v.mail.port !== usual ? `:${v.mail.port}` : '');
+  setRadio(f, 'security', v.mail.security);
+  field(f, 'username').value = v.mail.username;
+  field(f, 'from').value = v.mail.from;
+  field(f, 'password').value = '';
+  field(f, 'password').placeholder = v.password_set ? 'Saved. Type to replace it.' : '';
+}
+
+function setTestResult(text, tone) {
+  const out = $('#alarm-test-result');
+  out.textContent = text;
+  out.className = tone ? `test-result ${tone}` : 'test-result';
+}
+
+async function openAlarmSettings() {
+  closeMenu();
+  if ($('#alarms-dialog').open) $('#alarms-dialog').close();
+  $('#alarm-settings-error').textContent = '';
+  setTestResult('');
+  try {
+    fillAlarmSettings(await api('/api/alarms/settings'));
+    $('#alarm-settings-dialog').showModal();
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+async function onAlarmSettingsSave(ev) {
+  ev.preventDefault();
+  const btn = $('#alarm-settings-save');
+  btn.disabled = true;
+  $('#alarm-settings-error').textContent = '';
+  try {
+    const v = await api('/api/alarms/settings', { method: 'PUT', json: readAlarmSettings() });
+    $('#alarm-settings-dialog').close();
+    toast(v.to.length && v.mail.host ? 'Alarm settings saved' : 'Saved. No email goes out until a mail server and an address are filled in.');
+    listChanged();
+  } catch (e) {
+    $('#alarm-settings-error').textContent = e.message ? cap(e.message) : 'Could not save the alarm settings.';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function onAlarmTest() {
+  const btn = $('#alarm-test');
+  btn.disabled = true;
+  setTestResult('Sending…');
+  try {
+    const r = await api('/api/alarms/test', { json: readAlarmSettings() });
+    setTestResult(r.text, r.ok ? 'ok' : 'bad');
+  } catch (e) {
+    setTestResult(e.message ? cap(e.message) : 'Could not send the test email.', 'bad');
+  } finally {
+    btn.disabled = false;
+  }
+}
 /*@end*/
 
 // ----- menu & theme ------------------------------------------------------------
@@ -3377,6 +3789,15 @@ function bind() {
   $('#phone-open').addEventListener('click', openPhone);
   $('#phone-host').addEventListener('change', (e) => showPhoneCodes(e.target.value));
   $('#phone-name-form').addEventListener('submit', onPhoneName);
+  $('#alarms-open').addEventListener('click', openAlarms);
+  $('#alarm-settings-open').addEventListener('click', openAlarmSettings);
+  $('#alarms-to-settings').addEventListener('click', openAlarmSettings);
+  $('#alarm-settings-form').addEventListener('submit', onAlarmSettingsSave);
+  $('#alarm-test').addEventListener('click', onAlarmTest);
+  $('#alarm-banner-show').addEventListener('click', onBannerShow);
+  $('#alarm-banner-pause').addEventListener('click', () => { const a = alarmsNow().active[0]; if (a && a.target_id !== null) pauseAlarms(a.target_id, 60); });
+  $('#t-alarm-pause').addEventListener('click', () => { if (S.selected !== null) pauseAlarms(S.selected, alarmsPaused(S.selected) ? 0 : 60); });
+  $$('input[name="alarm_mode"]').forEach((r) => r.addEventListener('change', syncTargetAlarm));
   $('#shares-open').addEventListener('click', () => openShares());
   $('#share-new').addEventListener('click', () => openShareDialog(null, S.selected));
   $('#t-share').addEventListener('click', () => openShareDialog(null, S.selected));
